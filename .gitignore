@@ -1,0 +1,8 @@
+/bin/
+/.cache/
+/dist/
+*.out
+*.test
+coverage.out
+.DS_Store
+STORY.md
