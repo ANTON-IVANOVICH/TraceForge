@@ -44,6 +44,7 @@ func (s *Sender) Send(ctx context.Context, batch model.Batch) error {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-ID", batch.AgentID)
 
 	resp, err := s.client.Do(req)
 	if err != nil {

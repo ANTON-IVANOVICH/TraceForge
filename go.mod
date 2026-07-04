@@ -2,7 +2,10 @@ module metrics-system
 
 go 1.26.2
 
-require github.com/shirou/gopsutil/v4 v4.26.4
+require (
+	github.com/shirou/gopsutil/v4 v4.26.4
+	golang.org/x/time v0.15.0
+)
 
 require (
 	github.com/ebitengine/purego v0.10.0 // indirect
