@@ -73,6 +73,26 @@ func TestHandler_IngestInvalidBatch(t *testing.T) {
 	}
 }
 
+func TestHandler_IngestRejectsUnknownField(t *testing.T) {
+	h, _, _ := newTestHandler(pipeline.Config{IngestBuffer: 10}, false)
+	body := `{"agent_id":"a","metrics":[{"name":"m","type":"gauge","value":1,"timestamp":"2026-07-04T10:00:00Z"}],"bogus":1}`
+	rec := httptest.NewRecorder()
+	h.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/metrics", bytes.NewBufferString(body)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (unknown field must be rejected)", rec.Code)
+	}
+}
+
+func TestHandler_IngestRejectsTrailingData(t *testing.T) {
+	h, _, _ := newTestHandler(pipeline.Config{IngestBuffer: 10}, false)
+	body := `{"agent_id":"a","metrics":[{"name":"m","type":"gauge","value":1,"timestamp":"2026-07-04T10:00:00Z"}]}{"x":1}`
+	rec := httptest.NewRecorder()
+	h.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/metrics", bytes.NewBufferString(body)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (trailing data must be rejected)", rec.Code)
+	}
+}
+
 func TestHandler_IngestOverloaded(t *testing.T) {
 	// Buffer 1, pipeline NOT started => the 2nd ingest overflows -> 503.
 	h, _, _ := newTestHandler(pipeline.Config{IngestBuffer: 1}, false)

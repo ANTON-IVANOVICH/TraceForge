@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
@@ -53,8 +54,16 @@ func (h *Handler) ingest(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
 	var batch model.Batch
-	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+	if err := dec.Decode(&batch); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	// Reject any trailing data after the batch object.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
