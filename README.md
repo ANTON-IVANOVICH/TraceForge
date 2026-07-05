@@ -166,3 +166,6 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
 - **v0.1.0** — MVP: agent + in-memory server with a REST API.
 - **v0.2.0** — Channel pipeline, in-memory TSDB, query API with aggregations,
   middleware chain, per-agent rate limiting, self-stats and pprof.
+- **v0.3.0** — Persistent storage: `bolt` (bbolt B+tree) and a from-scratch
+  on-disk `tsdb` (WAL + immutable mmap'd chunks) behind the `Storage` interface,
+  selectable with `-storage`; both survive a restart.
