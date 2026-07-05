@@ -134,7 +134,7 @@ Priority: defaults → environment variables → flags.
 ```bash
 make test                                                    # race + coverage
 go test -bench=. -benchmem ./internal/server/pipeline/       # throughput benchmark
-go tool pprof http://localhost:8080/debug/pprof/profile?seconds=30
+go tool pprof 'http://localhost:8080/debug/pprof/profile?seconds=10'   # quote for zsh; keep < 15s WriteTimeout
 ```
 
 ## Milestones
