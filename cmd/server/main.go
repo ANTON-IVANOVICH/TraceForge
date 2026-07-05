@@ -11,9 +11,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"metrics-system/internal/server"
+	"metrics-system/internal/server/grpcserver"
 	"metrics-system/internal/server/pipeline"
 	"metrics-system/internal/server/ratelimit"
 	"metrics-system/internal/server/storage"
@@ -50,16 +52,53 @@ func main() {
 	)
 	srv := server.New(cfg.addr, routes, logger)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// Optional gRPC transport, sharing the same pipeline and store as HTTP.
+	var grpcSrv *grpcserver.Server
+	if cfg.grpcAddr != "" {
+		svc := grpcserver.NewService(pipe, store, logger)
+		grpcSrv, err = grpcserver.New(cfg.grpcAddr, svc, logger)
+		if err != nil {
+			logger.Error("grpc listen failed", "addr", cfg.grpcAddr, "error", err)
+			os.Exit(1)
+		}
+	}
+
+	// signal.NotifyContext's stop only detaches the signal relay; use a separate
+	// cancel so one server's failure can bring the other down too.
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
 
 	pipe.Start()
 
-	logger.Info("server started", "addr", cfg.addr, "storage", cfg.storageType)
-	runErr := srv.Run(ctx)
+	// Run both transports concurrently. Each cancels the shared context on
+	// failure so the other drains too.
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	run := func(name string, r interface{ Run(context.Context) error }) {
+		defer wg.Done()
+		if err := r.Run(ctx); err != nil {
+			errs <- fmt.Errorf("%s: %w", name, err)
+			cancel()
+		}
+	}
 
-	// srv.Run has returned => the HTTP server is fully stopped and no handler is
-	// still running, so no Ingest call can race the drain below.
+	wg.Add(1)
+	go run("http", srv)
+	if grpcSrv != nil {
+		wg.Add(1)
+		go run("grpc", grpcSrv)
+		logger.Info("server started", "http_addr", cfg.addr, "grpc_addr", cfg.grpcAddr, "storage", cfg.storageType)
+	} else {
+		logger.Info("server started", "http_addr", cfg.addr, "storage", cfg.storageType)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	// Both servers are fully stopped => no handler is still running, so no Ingest
+	// call can race the drain below.
 	pipe.Shutdown()
 
 	// All ingested metrics are now flushed into storage; close it (flush WAL,
@@ -68,8 +107,12 @@ func main() {
 		logger.Error("storage close failed", "error", err)
 	}
 
-	if runErr != nil {
-		logger.Error("server terminated", "error", runErr)
+	var failed bool
+	for err := range errs {
+		logger.Error("server terminated", "error", err)
+		failed = true
+	}
+	if failed {
 		os.Exit(1)
 	}
 	logger.Info("server stopped")
@@ -95,6 +138,7 @@ func openStorage(cfg config, logger *slog.Logger) (storage.Storage, error) {
 // config holds the resolved server settings. Priority: defaults -> env -> flags.
 type config struct {
 	addr            string
+	grpcAddr        string
 	logLevel        string
 	storageType     string
 	dataDir         string
@@ -109,6 +153,7 @@ type config struct {
 func loadConfig() config {
 	cfg := config{
 		addr:            envString("SERVER_ADDR", ":8080"),
+		grpcAddr:        envString("GRPC_ADDR", ":9090"),
 		logLevel:        envString("SERVER_LOG_LEVEL", "info"),
 		storageType:     envString("STORAGE", "memory"),
 		dataDir:         envString("DATA_DIR", "./data"),
@@ -120,7 +165,8 @@ func loadConfig() config {
 		rateLimitBurst:  envInt("RATE_LIMIT_BURST", 200),
 	}
 
-	flag.StringVar(&cfg.addr, "addr", cfg.addr, "listen address")
+	flag.StringVar(&cfg.addr, "addr", cfg.addr, "HTTP listen address")
+	flag.StringVar(&cfg.grpcAddr, "grpc-addr", cfg.grpcAddr, "gRPC listen address (empty to disable)")
 	flag.StringVar(&cfg.logLevel, "log-level", cfg.logLevel, "log level: debug|info|warn|error")
 	flag.StringVar(&cfg.storageType, "storage", cfg.storageType, "storage backend: memory|bolt|tsdb")
 	flag.StringVar(&cfg.dataDir, "data-dir", cfg.dataDir, "data directory for persistent backends")

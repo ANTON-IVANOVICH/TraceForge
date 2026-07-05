@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package metrics.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The generated Go code lives in internal/proto/metricspb.
+option go_package = "metrics-system/internal/proto/metricspb;metricspb";
+
+// MetricType mirrors model.MetricType. UNSPECIFIED (0) is the proto3 zero value
+// and is treated as invalid on ingest.
+enum MetricType {
+  METRIC_TYPE_UNSPECIFIED = 0;
+  METRIC_TYPE_GAUGE = 1;
+  METRIC_TYPE_COUNTER = 2;
+}
+
+// Metric is a single measurement, the protobuf twin of model.Metric.
+message Metric {
+  string name = 1;
+  MetricType type = 2;
+  double value = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  map<string, string> labels = 5;
+}
+
+// Batch is a packet of metrics from one agent.
+message Batch {
+  string agent_id = 1;
+  repeated Metric metrics = 2;
+}
+
+// IngestAck is the server's response to a batch. On the bidirectional stream one
+// ack is returned per received batch, so a client can react to backpressure.
+message IngestAck {
+  uint64 accepted = 1;  // metrics accepted into the pipeline
+  bool throttled = 2;   // pipeline was saturated; the client should back off
+}
+
+// IngestSummary aggregates the outcome of a whole ingest stream. It is not sent
+// today (acks are per-batch) but is reserved for a client-streaming variant.
+message IngestSummary {
+  uint64 batches = 1;
+  uint64 metrics = 2;
+  uint64 throttled = 3;
+}
+
+// QueryRequest mirrors storage.Query. Empty from/to mean open bounds; step
+// requires agg. limit == 0 means no limit.
+message QueryRequest {
+  string name = 1;
+  map<string, string> labels = 2;
+  google.protobuf.Timestamp from = 3;
+  google.protobuf.Timestamp to = 4;
+  string agg = 5;   // "" | avg | min | max | sum | count | p50 | p90 | p95 | p99
+  string step = 6;  // Go duration string, e.g. "1m"; requires agg
+  uint32 limit = 7;
+}
+
+// MetricsService is the gRPC transport between agent and server. It offers the
+// three RPC styles: unary, bidirectional streaming and server streaming.
+service MetricsService {
+  // Ingest submits one batch and returns its ack (unary).
+  rpc Ingest(Batch) returns (IngestAck);
+
+  // IngestStream is a long-lived bidirectional stream: the client sends batches
+  // and the server replies with one IngestAck per batch, carrying the throttle
+  // signal back to the sender.
+  rpc IngestStream(stream Batch) returns (stream IngestAck);
+
+  // Query returns the matching (optionally aggregated) metrics as a server
+  // stream, one Metric per message.
+  rpc Query(QueryRequest) returns (stream Metric);
+}

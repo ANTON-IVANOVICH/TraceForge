@@ -8,40 +8,49 @@ ingests, stores and serves them.
 ## Architecture
 
 ```text
-agent(s) ──POST /api/v1/metrics──► server
-                                     │
-            ingest ─► validate ─► enrich ─► store   (channel pipeline, worker pools)
-                                     │
-                                     ▼
-                        in-memory TSDB (series + name index)
-                                     ▲
-GET /api/v1/query ───────────────────┘
+              HTTP  POST /api/v1/metrics ──┐
+agent(s) ─────┤                            ├──► server
+              gRPC  IngestStream (stream) ─┘      │
+                                                  ▼
+           ingest ─► validate ─► enrich ─► store   (channel pipeline, worker pools)
+                                                  │
+                                                  ▼
+                     storage: memory | bolt | tsdb
+                                                  ▲
+              HTTP  GET /api/v1/query ────────────┤
+              gRPC  Query (server stream) ────────┘
 ```
 
 - **Agent** — every N seconds collects CPU, RAM, disk and uptime, packs them
-  into a `Batch` and ships it over HTTP with retry/backoff.
-- **Server** — accepts batches into a channel pipeline
-  (`ingest → validate → enrich → store`) with configurable worker pools and
-  backpressure (a full ingest buffer returns HTTP 503). Metrics land in an
-  in-memory time-series store (one series per name+labels, indexed by name)
-  and are read back through a query API with label filtering and aggregations.
+  into a `Batch` and ships it over **HTTP** (JSON) or **gRPC** (protobuf,
+  streaming), selectable with `-transport`.
+- **Server** — exposes both an HTTP and a gRPC transport that feed the *same*
+  channel pipeline (`ingest → validate → enrich → store`), with configurable
+  worker pools and backpressure (a full ingest buffer returns HTTP `503` /
+  gRPC `ResourceExhausted`). Metrics land in a persistent-or-in-memory
+  time-series store (one series per name+labels, indexed by name) and are read
+  back through a query API with label filtering and aggregations.
 
 ## Layout
 
 ```text
 .
+├── proto/metrics/v1/          # protobuf service + message definitions
 ├── cmd/
-│   ├── agent/main.go          # agent entry point
-│   └── server/main.go         # server entry point + config
+│   ├── agent/main.go          # agent entry point (transport selection)
+│   └── server/main.go         # server entry point + config (HTTP + gRPC)
 ├── internal/
-│   ├── agent/                 # collectors (cpu/memory/disk/uptime), sender, orchestration
+│   ├── agent/                 # collectors, HTTP sender, gRPC streaming sender
 │   ├── model/metric.go        # Metric, Batch, MetricType
+│   ├── grpcconv/              # model <-> protobuf conversion
+│   ├── proto/metricspb/       # generated protobuf + gRPC code (go generate)
 │   └── server/
 │       ├── handler.go         # thin HTTP handlers (ingest, query, stats, pprof)
 │       ├── middleware.go      # recover, request id, logging, rate limiting
 │       ├── server.go          # http.Server + graceful lifecycle
+│       ├── grpcserver/        # gRPC service, interceptors, lifecycle
 │       ├── pipeline/          # channel pipeline: stages, worker pools, self-stats
-│       ├── storage/           # in-memory TSDB: series, name index, query + aggregations
+│       ├── storage/           # TSDB: series/index/query + memory, bolt, tsdb backends
 │       └── ratelimit/         # per-agent token-bucket limiter
 └── pkg/
     └── httpx/client.go        # reusable HTTP client with retry + backoff
@@ -103,6 +112,38 @@ curl -s http://localhost:8080/debug/stats | jq
 curl -i http://localhost:8080/healthz
 ```
 
+## gRPC transport
+
+Alongside HTTP, the server speaks gRPC (Protocol Buffers) on a separate port
+(`-grpc-addr`, default `:9090`), feeding the *same* pipeline and store. The
+service (`proto/metrics/v1/metrics.proto`) offers all three RPC styles:
+
+- `Ingest(Batch) → IngestAck` — **unary**; backpressure surfaces as
+  `ResourceExhausted`.
+- `IngestStream(stream Batch) → stream IngestAck` — **bidirectional**; the agent
+  keeps one long-lived stream open and the server acks each batch, carrying a
+  `throttled` flag back so a fast client can back off without a new RPC per tick.
+- `Query(QueryRequest) → stream Metric` — **server streaming**.
+
+Point the agent at it with `-transport=grpc`:
+
+```bash
+./bin/server                                   # HTTP :8080 + gRPC :9090
+./bin/agent -transport=grpc -grpc-server=localhost:9090
+```
+
+Server reflection is enabled, so you can poke it with
+[`grpcurl`](https://github.com/fullstorydev/grpcurl):
+
+```bash
+grpcurl -plaintext localhost:9090 list metrics.v1.MetricsService
+grpcurl -plaintext -d '{"name":"cpu_usage_percent"}' \
+  localhost:9090 metrics.v1.MetricsService/Query
+```
+
+Regenerate the protobuf/gRPC code after editing the `.proto` with
+`make proto-tools` (once) then `make proto` (or `go generate ./...`).
+
 ## Storage backends
 
 Pick the store with `-storage`; persistent backends keep data in `-data-dir`.
@@ -129,7 +170,8 @@ Priority: defaults → environment variables → flags.
 
 ### Server
 
-- `-addr` / `SERVER_ADDR` — listen address (default `:8080`)
+- `-addr` / `SERVER_ADDR` — HTTP listen address (default `:8080`)
+- `-grpc-addr` / `GRPC_ADDR` — gRPC listen address, empty to disable (default `:9090`)
 - `-log-level` / `SERVER_LOG_LEVEL` — `debug|info|warn|error` (default `info`)
 - `-storage` / `STORAGE` — backend: `memory` | `bolt` | `tsdb` (default `memory`)
 - `-data-dir` / `DATA_DIR` — data directory for the `bolt`/`tsdb` backends (default `./data`)
@@ -142,7 +184,9 @@ Priority: defaults → environment variables → flags.
 
 ### Agent
 
-- `-server` / `AGENT_SERVER` — default `http://localhost:8080/api/v1/metrics`
+- `-transport` / `AGENT_TRANSPORT` — `http` | `grpc` (default `http`)
+- `-server` / `AGENT_SERVER` — HTTP endpoint (default `http://localhost:8080/api/v1/metrics`)
+- `-grpc-server` / `AGENT_GRPC_SERVER` — gRPC target host:port (default `localhost:9090`)
 - `-interval` / `AGENT_INTERVAL` — default `5s`
 - `-id` / `AGENT_ID` — default hostname
 - `-disk-path` / `AGENT_DISK_PATH` — default `/`
@@ -169,3 +213,6 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
 - **v0.3.0** — Persistent storage: `bolt` (bbolt B+tree) and a from-scratch
   on-disk `tsdb` (WAL + immutable mmap'd chunks) behind the `Storage` interface,
   selectable with `-storage`; both survive a restart.
+- **v0.4.0** — gRPC + Protocol Buffers transport alongside HTTP: unary,
+  bidirectional-streaming and server-streaming RPCs feeding the same pipeline;
+  agent `-transport=grpc`; recovery/logging interceptors and reflection.

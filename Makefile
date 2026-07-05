@@ -1,7 +1,22 @@
-.PHONY: tidy build test vet lint lint-install run-server run-agent
+.PHONY: tidy build test vet lint lint-install run-server run-agent proto proto-tools
+
+GOBIN := $(shell go env GOPATH)/bin
 
 tidy:
 	go mod tidy
+
+# Install the protoc Go plugins used by `make proto`.
+proto-tools:
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+
+# Regenerate protobuf + gRPC code from proto/ into internal/proto/metricspb.
+# Requires protoc on PATH and `make proto-tools` already run.
+proto:
+	PATH="$(GOBIN):$$PATH" protoc \
+		--go_out=. --go_opt=module=metrics-system \
+		--go-grpc_out=. --go-grpc_opt=module=metrics-system \
+		proto/metrics/v1/metrics.proto
 
 build:
 	mkdir -p bin

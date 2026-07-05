@@ -9,15 +9,22 @@ import (
 	"metrics-system/internal/model"
 )
 
+// Transport ships a batch to the server. It abstracts over the wire protocol:
+// there is an HTTP implementation (Sender) and a gRPC one (GRPCSender).
+type Transport interface {
+	Send(ctx context.Context, batch model.Batch) error
+	Close() error
+}
+
 type Agent struct {
 	id         string
 	interval   time.Duration
 	collectors []Collector
-	sender     *Sender
+	transport  Transport
 	logger     *slog.Logger
 }
 
-func New(id string, interval time.Duration, collectors []Collector, sender *Sender, logger *slog.Logger) *Agent {
+func New(id string, interval time.Duration, collectors []Collector, transport Transport, logger *slog.Logger) *Agent {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
@@ -28,7 +35,7 @@ func New(id string, interval time.Duration, collectors []Collector, sender *Send
 		id:         id,
 		interval:   interval,
 		collectors: collectors,
-		sender:     sender,
+		transport:  transport,
 		logger:     logger,
 	}
 }
@@ -36,6 +43,12 @@ func New(id string, interval time.Duration, collectors []Collector, sender *Send
 func (a *Agent) Run(ctx context.Context) error {
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
+	// Release the transport (close the gRPC stream/connection) on the way out.
+	defer func() {
+		if err := a.transport.Close(); err != nil {
+			a.logger.Warn("transport close failed", "error", err)
+		}
+	}()
 
 	a.logger.Info("agent started", "id", a.id, "interval", a.interval.String(), "collectors", len(a.collectors))
 
@@ -60,7 +73,7 @@ func (a *Agent) tick(ctx context.Context) {
 	}
 
 	batch := model.Batch{AgentID: a.id, Metrics: metrics}
-	if err := a.sender.Send(tickCtx, batch); err != nil {
+	if err := a.transport.Send(tickCtx, batch); err != nil {
 		a.logger.Error("send failed", "error", err, "count", len(metrics))
 		return
 	}

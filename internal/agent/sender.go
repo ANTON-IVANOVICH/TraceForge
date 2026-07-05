@@ -64,3 +64,7 @@ func (s *Sender) Send(ctx context.Context, batch model.Batch) error {
 
 	return nil
 }
+
+// Close satisfies Transport. The HTTP sender holds no long-lived resources, so
+// there is nothing to release.
+func (s *Sender) Close() error { return nil }

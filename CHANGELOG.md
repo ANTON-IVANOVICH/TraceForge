@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-05
+
+A gRPC + Protocol Buffers transport between agent and server, alongside HTTP.
+
+### Added
+
+- Protobuf-defined `metrics.v1.MetricsService` (`proto/metrics/v1/metrics.proto`)
+  with all three RPC styles: `Ingest` (unary), `IngestStream` (bidirectional
+  streaming) and `Query` (server streaming). Generated code lives in
+  `internal/proto/metricspb` (regenerated with `make proto` or `go generate`).
+- gRPC server (`internal/server/grpcserver`) that funnels batches into the same
+  pipeline and store as HTTP, with panic-recovery and request-logging
+  interceptors, server reflection, and a graceful-stop lifecycle mirroring the
+  HTTP server.
+- Agent gRPC transport: a single long-lived bidirectional stream reused across
+  ticks (lockstep send/ack, reopened transparently on error), selectable with
+  `-transport=grpc` / `-grpc-server`.
+- `-grpc-addr` / `GRPC_ADDR` server flag (default `:9090`, empty to disable).
+- `internal/grpcconv` for model <-> protobuf conversion.
+- Tests: conversion round-trip, gRPC service integration over a loopback
+  listener, and the agent streaming sender.
+
+### Changed
+
+- The agent now ships through a `Transport` interface; the HTTP sender is one
+  implementation and the new gRPC streaming sender another.
+- gRPC backpressure: unary `Ingest` returns `ResourceExhausted`; the stream
+  replies with `IngestAck.throttled = true`.
+
+### Dependencies
+
+- Added `google.golang.org/grpc` and `google.golang.org/protobuf`.
+
 ## [0.3.0] - 2026-07-05
 
 Persistent storage: two on-disk backends behind the `Storage` interface,
@@ -125,7 +158,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ANTON-IVANOVICH/TraceForge/releases/tag/v0.1.0
