@@ -53,11 +53,41 @@ func (p *Pipeline) enrichStage(_ int) {
 	}
 }
 
-// storeStage writes metrics into the storage backend.
+// storeStage batches metrics and flushes them to storage by size or on a short
+// timer. Batching turns many tiny writes into few WriteBatch calls — essential
+// for transactional backends like bbolt where each commit is costly.
 func (p *Pipeline) storeStage(_ int) {
-	for m := range p.storeCh {
-		p.storage.Write(m)
-		p.stats.IncStored(1)
+	const maxBatch = 1000
+	batch := make([]model.Metric, 0, maxBatch)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := p.storage.WriteBatch(batch); err != nil {
+			p.logger.Error("store batch failed", "error", err, "count", len(batch))
+		} else {
+			p.stats.IncStored(int64(len(batch)))
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case m, ok := <-p.storeCh:
+			if !ok { // storeCh closed on drain: flush the tail and exit
+				flush()
+				return
+			}
+			batch = append(batch, m)
+			if len(batch) >= maxBatch {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
 	}
 }
 

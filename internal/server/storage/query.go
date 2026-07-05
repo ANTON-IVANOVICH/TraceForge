@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"metrics-system/internal/model"
 )
 
 // Query describes a read against the store. Name is required.
@@ -14,6 +16,42 @@ type Query struct {
 	Aggregator Aggregator        // nil = raw points
 	Step       time.Duration     // aggregation window size
 	Limit      int               // 0 = unlimited
+}
+
+// ApplyQuery converts one series' already-time-filtered points into result
+// metrics: raw points when q.Aggregator is nil, otherwise one aggregated value
+// per non-empty window of q.Step. It does not apply q.Limit — the caller applies
+// the limit across all series. Every storage backend uses this so aggregation
+// behaves identically regardless of where the points came from.
+func ApplyQuery(q Query, name string, typ model.MetricType, labels map[string]string, points []Point) []model.Metric {
+	if len(points) == 0 {
+		return nil
+	}
+	if q.Aggregator == nil {
+		out := make([]model.Metric, 0, len(points))
+		for _, pt := range points {
+			out = append(out, model.Metric{
+				Name:      name,
+				Type:      typ,
+				Value:     pt.Value,
+				Timestamp: pt.Timestamp,
+				Labels:    CloneLabels(labels),
+			})
+		}
+		return out
+	}
+	windows := splitWindows(points, q.From, q.To, q.Step)
+	out := make([]model.Metric, 0, len(windows))
+	for _, w := range windows {
+		out = append(out, model.Metric{
+			Name:      name,
+			Type:      typ,
+			Value:     q.Aggregator.Aggregate(w.points),
+			Timestamp: w.end,
+			Labels:    CloneLabels(labels),
+		})
+	}
+	return out
 }
 
 // Aggregator collapses a window of points into a single value (strategy pattern).

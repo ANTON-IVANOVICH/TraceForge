@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -15,6 +17,8 @@ import (
 	"metrics-system/internal/server/pipeline"
 	"metrics-system/internal/server/ratelimit"
 	"metrics-system/internal/server/storage"
+	"metrics-system/internal/server/storage/bolt"
+	"metrics-system/internal/server/storage/tsdb"
 )
 
 func main() {
@@ -22,7 +26,12 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: parseLogLevel(cfg.logLevel)}))
 
-	store := storage.NewMemoryStorage()
+	store, err := openStorage(cfg, logger)
+	if err != nil {
+		logger.Error("open storage failed", "type", cfg.storageType, "error", err)
+		os.Exit(1)
+	}
+
 	pipe := pipeline.New(store, pipeline.Config{
 		IngestBuffer:    cfg.ingestBuffer,
 		ValidateWorkers: cfg.validateWorkers,
@@ -46,12 +55,18 @@ func main() {
 
 	pipe.Start()
 
-	logger.Info("server started", "addr", cfg.addr)
+	logger.Info("server started", "addr", cfg.addr, "storage", cfg.storageType)
 	runErr := srv.Run(ctx)
 
 	// srv.Run has returned => the HTTP server is fully stopped and no handler is
 	// still running, so no Ingest call can race the drain below.
 	pipe.Shutdown()
+
+	// All ingested metrics are now flushed into storage; close it (flush WAL,
+	// release the file lock, close the DB).
+	if err := store.Close(); err != nil {
+		logger.Error("storage close failed", "error", err)
+	}
 
 	if runErr != nil {
 		logger.Error("server terminated", "error", runErr)
@@ -60,10 +75,29 @@ func main() {
 	logger.Info("server stopped")
 }
 
+// openStorage builds the storage backend selected by -storage.
+func openStorage(cfg config, logger *slog.Logger) (storage.Storage, error) {
+	switch cfg.storageType {
+	case "memory":
+		return storage.NewMemoryStorage(), nil
+	case "bolt":
+		if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
+			return nil, err
+		}
+		return bolt.New(filepath.Join(cfg.dataDir, "metrics.bolt"))
+	case "tsdb":
+		return tsdb.Open(filepath.Join(cfg.dataDir, "tsdb"), logger)
+	default:
+		return nil, fmt.Errorf("unknown storage type %q (want memory|bolt|tsdb)", cfg.storageType)
+	}
+}
+
 // config holds the resolved server settings. Priority: defaults -> env -> flags.
 type config struct {
 	addr            string
 	logLevel        string
+	storageType     string
+	dataDir         string
 	ingestBuffer    int
 	validateWorkers int
 	enrichWorkers   int
@@ -76,6 +110,8 @@ func loadConfig() config {
 	cfg := config{
 		addr:            envString("SERVER_ADDR", ":8080"),
 		logLevel:        envString("SERVER_LOG_LEVEL", "info"),
+		storageType:     envString("STORAGE", "memory"),
+		dataDir:         envString("DATA_DIR", "./data"),
 		ingestBuffer:    envInt("INGEST_BUFFER", 1000),
 		validateWorkers: envInt("VALIDATE_WORKERS", runtime.NumCPU()),
 		enrichWorkers:   envInt("ENRICH_WORKERS", runtime.NumCPU()),
@@ -86,6 +122,8 @@ func loadConfig() config {
 
 	flag.StringVar(&cfg.addr, "addr", cfg.addr, "listen address")
 	flag.StringVar(&cfg.logLevel, "log-level", cfg.logLevel, "log level: debug|info|warn|error")
+	flag.StringVar(&cfg.storageType, "storage", cfg.storageType, "storage backend: memory|bolt|tsdb")
+	flag.StringVar(&cfg.dataDir, "data-dir", cfg.dataDir, "data directory for persistent backends")
 	flag.IntVar(&cfg.ingestBuffer, "ingest-buffer", cfg.ingestBuffer, "ingest channel buffer size")
 	flag.IntVar(&cfg.validateWorkers, "validate-workers", cfg.validateWorkers, "number of validate workers")
 	flag.IntVar(&cfg.enrichWorkers, "enrich-workers", cfg.enrichWorkers, "number of enrich workers")

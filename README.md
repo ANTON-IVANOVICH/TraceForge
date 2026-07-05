@@ -103,6 +103,26 @@ curl -s http://localhost:8080/debug/stats | jq
 curl -i http://localhost:8080/healthz
 ```
 
+## Storage backends
+
+Pick the store with `-storage`; persistent backends keep data in `-data-dir`.
+All three implement the same `Storage` interface, so the pipeline and API are
+identical regardless of choice.
+
+- **`memory`** (default) — fast, in-process; lost on restart.
+- **`bolt`** — a persistent bbolt (B+tree) file. Timestamps are big-endian keys,
+  so a time-range query is a cursor range scan.
+- **`tsdb`** — a from-scratch on-disk engine: a CRC-checked write-ahead log
+  (crash recovery), an in-memory head, and immutable chunks written atomically
+  and read back via `mmap`. Single-writer (file-locked).
+
+Both persistent backends survive a restart:
+
+```bash
+./bin/server -storage=tsdb -data-dir=./data   # ingest metrics, then Ctrl+C
+./bin/server -storage=tsdb -data-dir=./data   # restart: the data is still queryable
+```
+
 ## Configuration (flags + env)
 
 Priority: defaults → environment variables → flags.
@@ -111,6 +131,8 @@ Priority: defaults → environment variables → flags.
 
 - `-addr` / `SERVER_ADDR` — listen address (default `:8080`)
 - `-log-level` / `SERVER_LOG_LEVEL` — `debug|info|warn|error` (default `info`)
+- `-storage` / `STORAGE` — backend: `memory` | `bolt` | `tsdb` (default `memory`)
+- `-data-dir` / `DATA_DIR` — data directory for the `bolt`/`tsdb` backends (default `./data`)
 - `-ingest-buffer` / `INGEST_BUFFER` — ingest channel buffer / backpressure (default `1000`)
 - `-validate-workers` / `VALIDATE_WORKERS` — validate stage workers (default `NumCPU`)
 - `-enrich-workers` / `ENRICH_WORKERS` — enrich stage workers (default `NumCPU`)

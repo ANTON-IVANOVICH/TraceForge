@@ -4,6 +4,8 @@ go 1.26.2
 
 require (
 	github.com/shirou/gopsutil/v4 v4.26.4
+	go.etcd.io/bbolt v1.5.0
+	golang.org/x/sys v0.46.0
 	golang.org/x/time v0.15.0
 )
 
@@ -15,5 +17,4 @@ require (
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/sys v0.41.0 // indirect
 )

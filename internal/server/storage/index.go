@@ -37,9 +37,10 @@ func (ix *index) seriesForName(name string) []*Series {
 	return out
 }
 
-// seriesKey canonicalizes a metric into a stable key. Labels are sorted so
-// {host=a,region=b} and {region=b,host=a} collapse to the same series.
-func seriesKey(name string, labels map[string]string) string {
+// SeriesKey canonicalizes a metric into a stable key. Labels are sorted so
+// {host=a,region=b} and {region=b,host=a} collapse to the same series. Backends
+// use it as the on-disk key for a series.
+func SeriesKey(name string, labels map[string]string) string {
 	if len(labels) == 0 {
 		return name
 	}
@@ -64,7 +65,9 @@ func seriesKey(name string, labels map[string]string) string {
 	return b.String()
 }
 
-func cloneLabels(in map[string]string) map[string]string {
+// CloneLabels returns a copy of in (nil for an empty map) so callers can't
+// mutate a stored series' labels.
+func CloneLabels(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
 	}
@@ -75,9 +78,9 @@ func cloneLabels(in map[string]string) map[string]string {
 	return out
 }
 
-// matchLabels reports whether a series' labels satisfy every filter label.
+// MatchLabels reports whether a series' labels satisfy every filter label.
 // An empty filter matches everything.
-func matchLabels(labels, filter map[string]string) bool {
+func MatchLabels(labels, filter map[string]string) bool {
 	for k, v := range filter {
 		if labels[k] != v {
 			return false
@@ -86,10 +89,10 @@ func matchLabels(labels, filter map[string]string) bool {
 	return true
 }
 
-// filterTime returns points within [from, to]. Zero bounds are treated as
-// open. It scans linearly so it stays correct even if points are not perfectly
+// FilterTime returns points within [from, to]. Zero bounds are treated as open.
+// It scans linearly so it stays correct even if points are not perfectly
 // time-ordered.
-func filterTime(points []Point, from, to time.Time) []Point {
+func FilterTime(points []Point, from, to time.Time) []Point {
 	if from.IsZero() && to.IsZero() {
 		return points
 	}

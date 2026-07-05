@@ -23,20 +23,32 @@ func NewMemoryStorage() *MemoryStorage {
 	}
 }
 
-// Write appends the metric's value to its series, creating the series on first
-// sight. Safe for concurrent use.
-func (s *MemoryStorage) Write(m model.Metric) {
-	key := seriesKey(m.Name, m.Labels)
-
+// Write appends the metric's value to its series. Safe for concurrent use.
+func (s *MemoryStorage) Write(m model.Metric) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.writeLocked(m)
+	return nil
+}
 
+// WriteBatch appends many metrics under a single lock acquisition.
+func (s *MemoryStorage) WriteBatch(metrics []model.Metric) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range metrics {
+		s.writeLocked(m)
+	}
+	return nil
+}
+
+func (s *MemoryStorage) writeLocked(m model.Metric) {
+	key := SeriesKey(m.Name, m.Labels)
 	series, ok := s.series[key]
 	if !ok {
 		series = &Series{
 			Name:   m.Name,
 			Type:   m.Type,
-			Labels: cloneLabels(m.Labels),
+			Labels: CloneLabels(m.Labels),
 			Points: make([]Point, 0, 64),
 		}
 		s.series[key] = series
@@ -57,38 +69,12 @@ func (s *MemoryStorage) Query(q Query) ([]model.Metric, error) {
 
 	var result []model.Metric
 	for _, series := range s.idx.seriesForName(q.Name) {
-		if !matchLabels(series.Labels, q.Labels) {
+		if !MatchLabels(series.Labels, q.Labels) {
 			continue
 		}
-		points := filterTime(series.Points, q.From, q.To)
-		if len(points) == 0 {
-			continue
-		}
-
-		if q.Aggregator == nil {
-			for _, pt := range points {
-				result = append(result, model.Metric{
-					Name:      series.Name,
-					Type:      series.Type,
-					Value:     pt.Value,
-					Timestamp: pt.Timestamp,
-					Labels:    cloneLabels(series.Labels),
-				})
-				if q.Limit > 0 && len(result) >= q.Limit {
-					return result, nil
-				}
-			}
-			continue
-		}
-
-		for _, w := range splitWindows(points, q.From, q.To, q.Step) {
-			result = append(result, model.Metric{
-				Name:      series.Name,
-				Type:      series.Type,
-				Value:     q.Aggregator.Aggregate(w.points),
-				Timestamp: w.end,
-				Labels:    cloneLabels(series.Labels),
-			})
+		points := FilterTime(series.Points, q.From, q.To)
+		for _, m := range ApplyQuery(q, series.Name, series.Type, series.Labels, points) {
+			result = append(result, m)
 			if q.Limit > 0 && len(result) >= q.Limit {
 				return result, nil
 			}
@@ -108,3 +94,6 @@ func (s *MemoryStorage) Stats() Stats {
 	}
 	return Stats{Series: len(s.series), Points: points}
 }
+
+// Close is a no-op for the in-memory store.
+func (s *MemoryStorage) Close() error { return nil }

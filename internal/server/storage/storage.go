@@ -1,7 +1,9 @@
-// Package storage holds the in-memory time-series store that the pipeline
-// writes into and the query layer reads from. The Storage interface is kept
-// deliberately small so a persistent implementation can replace MemoryStorage
-// in a later stage without touching the pipeline or HTTP layers.
+// Package storage defines the time-series store abstraction the pipeline writes
+// into and the query layer reads from, plus an in-memory implementation. The
+// Storage interface is deliberately small so persistent backends (bbolt, a
+// custom on-disk TSDB) can be swapped in without touching the pipeline or HTTP
+// layers. Shared helpers (SeriesKey, MatchLabels, FilterTime, ApplyQuery) are
+// exported for those backends to reuse.
 package storage
 
 import (
@@ -10,14 +12,21 @@ import (
 	"metrics-system/internal/model"
 )
 
-// Storage is the persistence boundary for the pipeline.
+// Storage is the persistence boundary for the pipeline. All backends
+// (memory, bolt, tsdb) implement it, so the pipeline is agnostic to which one
+// is in use.
 type Storage interface {
-	// Write appends a single metric to its series.
-	Write(m model.Metric)
+	// Write persists a single metric.
+	Write(m model.Metric) error
+	// WriteBatch persists many metrics at once (backends may commit them in one
+	// transaction — much faster than one Write per point).
+	WriteBatch(metrics []model.Metric) error
 	// Query returns metrics matching q (raw points or aggregated windows).
 	Query(q Query) ([]model.Metric, error)
 	// Stats reports the current size of the store.
 	Stats() Stats
+	// Close flushes and releases the backend's resources.
+	Close() error
 }
 
 // Point is a single timestamped value inside a series.

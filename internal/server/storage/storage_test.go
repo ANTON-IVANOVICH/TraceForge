@@ -8,15 +8,15 @@ import (
 )
 
 func TestSeriesKeyCanonical(t *testing.T) {
-	k1 := seriesKey("cpu", map[string]string{"b": "2", "a": "1"})
-	k2 := seriesKey("cpu", map[string]string{"a": "1", "b": "2"})
+	k1 := SeriesKey("cpu", map[string]string{"b": "2", "a": "1"})
+	k2 := SeriesKey("cpu", map[string]string{"a": "1", "b": "2"})
 	if k1 != k2 {
 		t.Fatalf("keys differ regardless of insertion order: %q vs %q", k1, k2)
 	}
 	if want := "cpu{a=1,b=2}"; k1 != want {
 		t.Errorf("key = %q, want %q", k1, want)
 	}
-	if k := seriesKey("cpu", nil); k != "cpu" {
+	if k := SeriesKey("cpu", nil); k != "cpu" {
 		t.Errorf("no-label key = %q, want cpu", k)
 	}
 }
@@ -111,12 +111,12 @@ func TestFilterTime(t *testing.T) {
 		{Timestamp: base.Add(time.Minute), Value: 1},
 		{Timestamp: base.Add(2 * time.Minute), Value: 2},
 	}
-	got := filterTime(pts, base.Add(time.Minute), time.Time{})
+	got := FilterTime(pts, base.Add(time.Minute), time.Time{})
 	if len(got) != 2 || got[0].Value != 1 {
-		t.Errorf("filterTime(from) = %+v, want the last two points", got)
+		t.Errorf("FilterTime(from) = %+v, want the last two points", got)
 	}
-	if all := filterTime(pts, time.Time{}, time.Time{}); len(all) != 3 {
-		t.Errorf("filterTime(open) dropped points: %d", len(all))
+	if all := FilterTime(pts, time.Time{}, time.Time{}); len(all) != 3 {
+		t.Errorf("FilterTime(open) dropped points: %d", len(all))
 	}
 }
 

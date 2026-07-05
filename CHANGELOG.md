@@ -7,10 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-05
+
+Persistent storage: two on-disk backends behind the `Storage` interface,
+selectable at runtime.
+
+### Added
+
+- `bolt` backend (bbolt B+tree): metrics persisted with big-endian timestamp
+  keys so a time-range query is a cursor range scan; writes batched into single
+  transactions.
+- `tsdb` backend: a from-scratch LSM-style engine — a CRC-checked write-ahead
+  log (fsync + crash recovery), an in-memory head, and immutable chunks written
+  atomically (fsync + rename) and read back via mmap with binary search; time
+  pruning of chunks and a `flock` single-writer lock (lock-file fallback off Unix).
+- `-storage` / `STORAGE` (`memory` | `bolt` | `tsdb`) and `-data-dir` / `DATA_DIR`
+  to choose and locate the backend.
+- Fuzz target for the chunk header parser.
+
+### Changed
+
+- `Storage` interface: `Write` now returns an `error`; added `WriteBatch` and
+  `Close`. The pipeline's store stage batches metrics (by size or a 100ms timer)
+  into `WriteBatch` calls.
+- Exported shared query helpers (`SeriesKey`, `MatchLabels`, `FilterTime`,
+  `ApplyQuery`) so every backend aggregates identically.
+
 ### Fixed
 
 - Restore strict JSON decoding on ingest (reject unknown fields and trailing
   data), lost during the 0.2.0 pipeline rewrite.
+
+### Dependencies
+
+- Added `go.etcd.io/bbolt` (bolt backend) and `golang.org/x/sys` (mmap + flock).
 
 ## [0.2.0] - 2026-07-04
 
@@ -95,6 +125,7 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ANTON-IVANOVICH/TraceForge/releases/tag/v0.1.0
