@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TraceForge — Live Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">◆</span> TraceForge
+      <span class="sub">live dashboard</span>
+    </div>
+    <div class="conn">
+      <input id="cred" type="password" placeholder="API key or JWT (if auth is on)" autocomplete="off" />
+      <button id="connect">Connect</button>
+      <span id="status" class="status off" title="connection status">offline</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="counters" class="cards">
+      <div class="card"><div class="k">ingested</div><div class="v" id="c-ingested">–</div></div>
+      <div class="card"><div class="k">stored</div><div class="v" id="c-stored">–</div></div>
+      <div class="card"><div class="k">dropped</div><div class="v" id="c-dropped">–</div></div>
+      <div class="card"><div class="k">invalid</div><div class="v" id="c-invalid">–</div></div>
+      <div class="card"><div class="k">series</div><div class="v" id="c-series">–</div></div>
+      <div class="card"><div class="k">points</div><div class="v" id="c-points">–</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>Stored points over time</h2>
+      <canvas id="chart" height="120"></canvas>
+      <p id="chart-hint" class="hint">stats stream is admin-only; connect with an admin credential to see counters &amp; chart</p>
+    </section>
+
+    <section class="panel">
+      <h2>Live metrics <span id="rate" class="hint"></span></h2>
+      <table id="feed">
+        <thead><tr><th>time</th><th>name</th><th class="num">value</th><th>tenant</th><th>agent</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

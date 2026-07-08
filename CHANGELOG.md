@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-09
+
+An embedded live dashboard: a single-page app served from the binary and a
+from-scratch WebSocket that streams live metrics and stats to the browser.
+
+### Added
+
+- `internal/server/live`: a WebSocket server implemented from scratch on the
+  standard library (RFC 6455 handshake, frame codec, client-frame unmasking,
+  fragmentation, ping/pong/close) — no third-party WebSocket library.
+- A broadcast `Hub` (single-goroutine-owns-the-map pattern) that fans newly
+  stored metrics and periodic stats snapshots out to connected dashboards, with
+  non-blocking delivery (slow clients drop frames, never block the pipeline).
+- Embedded SPA under `web/` (`go:embed`), served at `/` with assets at
+  `/static/`; a live metric feed plus pipeline/storage counters and a chart.
+- Pipeline observer hook (`SetObserver`) invoked with each stored batch.
+- `-ui` / `UI` flag (default `true`) to serve the dashboard.
+
+### Changed
+
+- Multi-tenancy extends to the live stream: the `/ws` endpoint authenticates
+  from query params (browsers can't set WS handshake headers) and scopes the
+  feed to the caller's tenant; the stats stream is admin-only.
+- `statusRecorder` (logging middleware) now forwards `Hijack` so the WebSocket
+  upgrade works through the middleware chain.
+
 ## [0.5.0] - 2026-07-09
 
 Authentication, role-based access control and multi-tenant data isolation across
@@ -195,7 +221,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.2.0...v0.3.0

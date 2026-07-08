@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -140,4 +142,14 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	n, err := r.ResponseWriter.Write(b)
 	r.written += n
 	return n, err
+}
+
+// Hijack forwards to the underlying ResponseWriter so WebSocket upgrades work
+// even when this recorder is in the chain.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("underlying ResponseWriter is not a http.Hijacker")
+	}
+	return hj.Hijack()
 }

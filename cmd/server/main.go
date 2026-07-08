@@ -18,6 +18,7 @@ import (
 	"metrics-system/internal/auth"
 	"metrics-system/internal/server"
 	"metrics-system/internal/server/grpcserver"
+	"metrics-system/internal/server/live"
 	"metrics-system/internal/server/pipeline"
 	"metrics-system/internal/server/ratelimit"
 	"metrics-system/internal/server/storage"
@@ -52,6 +53,15 @@ func main() {
 
 	limiter := ratelimit.New(cfg.rateLimitRPS, cfg.rateLimitBurst)
 	handler := server.NewHandler(pipe, store, logger)
+
+	// Optional embedded live dashboard: the hub taps the pipeline's store stage
+	// and pushes updates over WebSocket to connected browsers.
+	var hub *live.Hub
+	if cfg.uiEnabled {
+		hub = live.NewHub(logger)
+		pipe.SetObserver(hub.PublishMetrics) // must be before pipe.Start
+		handler.SetUI(hub, authn)
+	}
 	// Recover (outer) -> request id -> logging -> rate limit -> [auth] -> handler.
 	mws := []server.Middleware{
 		server.Recover(logger),
@@ -85,6 +95,12 @@ func main() {
 	// Periodic JWKS refresh for RS256 key rotation.
 	for _, ks := range keySets {
 		go ks.Refresh(ctx, logger)
+	}
+
+	// Live dashboard: run the hub and periodically push stats snapshots.
+	if hub != nil {
+		go hub.Run(ctx)
+		go publishStatsLoop(ctx, hub, pipe, store)
 	}
 
 	pipe.Start()
@@ -133,6 +149,23 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("server stopped")
+}
+
+// publishStatsLoop pushes a stats snapshot to the live dashboard every 2s.
+func publishStatsLoop(ctx context.Context, hub *live.Hub, pipe *pipeline.Pipeline, store storage.Storage) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			hub.PublishStats(map[string]any{
+				"pipeline": pipe.Stats(),
+				"storage":  store.Stats(),
+			})
+		}
+	}
 }
 
 // openStorage builds the storage backend selected by -storage.
@@ -228,6 +261,8 @@ type config struct {
 	jwksURL     string
 	jwtIssuer   string
 	jwtAudience string
+
+	uiEnabled bool
 }
 
 func loadConfig() config {
@@ -249,6 +284,7 @@ func loadConfig() config {
 		jwksURL:         envString("JWKS_URL", ""),
 		jwtIssuer:       envString("JWT_ISSUER", ""),
 		jwtAudience:     envString("JWT_AUDIENCE", ""),
+		uiEnabled:       envBool("UI", true),
 	}
 
 	flag.StringVar(&cfg.addr, "addr", cfg.addr, "HTTP listen address")
@@ -268,6 +304,7 @@ func loadConfig() config {
 	flag.StringVar(&cfg.jwksURL, "jwks-url", cfg.jwksURL, "JWKS URL for RS256 JWT auth")
 	flag.StringVar(&cfg.jwtIssuer, "jwt-issuer", cfg.jwtIssuer, "required JWT issuer (optional)")
 	flag.StringVar(&cfg.jwtAudience, "jwt-audience", cfg.jwtAudience, "required JWT audience (optional)")
+	flag.BoolVar(&cfg.uiEnabled, "ui", cfg.uiEnabled, "serve the embedded live dashboard at /")
 	flag.Parse()
 
 	return cfg

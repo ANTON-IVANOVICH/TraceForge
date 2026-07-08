@@ -78,6 +78,9 @@ func (p *Pipeline) storeStage(_ int) {
 			p.logger.Error("store batch failed", "error", err, "count", len(batch))
 		} else {
 			p.stats.IncStored(int64(len(batch)))
+			if p.onStored != nil {
+				p.onStored(batch) // observer copies synchronously if it retains
+			}
 		}
 		batch = batch[:0]
 	}

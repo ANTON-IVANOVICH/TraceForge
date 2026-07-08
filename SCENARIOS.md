@@ -4,7 +4,7 @@ A catalog of end-to-end flows the system supports, written as runnable recipes.
 This file is maintained alongside the staged roadmap: each milestone that adds a
 user-visible capability also adds or updates the relevant scenarios here.
 
-- **Covers up to:** v0.5.0 (auth, RBAC, multi-tenancy)
+- **Covers up to:** v0.6.0 (embedded live dashboard)
 - **Last updated:** 2026-07-09
 
 Conventions used below:
@@ -237,7 +237,41 @@ server-controlled — a client cannot set or spoof it.
 
 ---
 
-## 6. Failure & edge flows
+## 6. Live dashboard
+
+### 6.1 Watch metrics in the browser
+
+**Goal:** see metrics update live.
+
+```bash
+./bin/server            # dashboard at http://localhost:8080/
+./bin/agent             # feed it
+```
+
+Open `http://localhost:8080/`. **Expected:** the metric feed fills as batches are
+stored, and the counters + chart update every ~2s. The page reconnects
+automatically if the server restarts.
+
+### 6.2 Dashboard with auth on
+
+**Goal:** a tenant sees only its own live metrics.
+
+```bash
+./bin/server -auth -api-keys=./api-keys.json
+```
+
+Open the dashboard, paste an API key (or JWT) into the credential field, and
+Connect. **Expected:** the WebSocket stream is scoped to that credential's
+tenant; the counters/chart appear only for an admin credential. A missing/invalid
+credential is rejected at the handshake (`401`).
+
+### 6.3 Disable the UI
+
+```bash
+./bin/server -ui=false     # no dashboard, no /ws; API + gRPC unchanged
+```
+
+## 7. Failure & edge flows
 
 | Flow | Trigger | Result |
 |------|---------|--------|

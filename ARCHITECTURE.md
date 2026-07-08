@@ -4,7 +4,7 @@ How the system is put together: components, data flow, the concurrency model,
 storage internals, and the design decisions behind them. Kept in sync with the
 staged roadmap.
 
-- **Covers up to:** v0.5.0 (auth, RBAC, multi-tenancy)
+- **Covers up to:** v0.6.0 (embedded live dashboard)
 - **Last updated:** 2026-07-09
 - Go module: `metrics-system`. Two binaries: `agent` and `server`.
 
@@ -177,7 +177,32 @@ Chain ─▶ APIKeyAuthenticator (SHA-256 hash lookup)
   path **forces** `tenant=<caller>` onto the query, so a tenant can only read its
   own series.
 
-### 4.6 Lifecycle
+### 4.6 Live dashboard (`internal/server/live`, `web`)
+
+```text
+store stage ──onStored(copy)──▶ Hub.PublishMetrics ─┐
+stats ticker ─────────────────▶ Hub.PublishStats ───┤ (non-blocking; drop on slow)
+                                                     ▼
+                            Hub (single goroutine owns the client set)
+                                                     │  per-client tenant filter
+                                                     ▼
+                        writePump ─▶ WebSocket text frame ─▶ browser SPA (go:embed)
+```
+
+- A from-scratch **WebSocket** (RFC 6455) on `net/http` hijack — handshake, frame
+  codec, client-frame unmasking, fragmentation, ping/pong/close. `statusRecorder`
+  forwards `Hijack` so the upgrade survives the middleware chain.
+- The **Hub** follows the single-goroutine-owns-the-map pattern (no locks):
+  register/unregister/metrics/stats flow through channels; delivery to each
+  client is a non-blocking send, so a slow browser drops frames instead of
+  stalling the pipeline. The pipeline feeds it via an `onStored` observer that
+  copies each batch (the pipeline reuses its backing array).
+- **Auth tie-in:** `/`, `/static/` and `/ws` are public at the middleware layer;
+  the `/ws` handler authenticates from query params (browsers can't set WS
+  handshake headers), scopes the client to its tenant, and gates the stats stream
+  to admins — so the live feed honors the same isolation as the query API.
+
+### 4.7 Lifecycle
 
 `signal.NotifyContext` (SIGINT/SIGTERM) → cancel → **both servers stop** (HTTP
 `Shutdown`, gRPC `GracefulStop`) → **`pipeline.Shutdown()`** drains all in-flight
@@ -211,7 +236,9 @@ internal/
     grpcserver/             gRPC service, interceptors, lifecycle
     pipeline/               channel pipeline: stages, worker pools, stats
     storage/                Storage interface, query engine, memory|bolt|tsdb
+    live/                   from-scratch WebSocket + broadcast hub
     ratelimit/              per-agent token-bucket limiter
+web/                        embedded dashboard SPA (go:embed)
 pkg/httpx/                  reusable HTTP client (retry + backoff)
 ```
 

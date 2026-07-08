@@ -3,6 +3,7 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"metrics-system/internal/auth"
 )
@@ -13,6 +14,11 @@ func actionForRequest(r *http.Request) (auth.Action, bool) {
 	switch {
 	case r.URL.Path == "/healthz":
 		return "", false // liveness is public
+	case r.URL.Path == "/" || r.URL.Path == "/ws" || strings.HasPrefix(r.URL.Path, "/static/"):
+		// Dashboard shell, static assets and the WS handshake are public at the
+		// middleware layer; the WS handler authenticates and tenant-scopes itself
+		// (browsers can't set headers on a WebSocket handshake).
+		return "", false
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/metrics":
 		return auth.ActionIngest, true
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/query":

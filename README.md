@@ -49,13 +49,16 @@ agent(s) ─────┤                            ├──► server
 │   ├── grpcconv/              # model <-> protobuf conversion
 │   ├── proto/metricspb/       # generated protobuf + gRPC code (go generate)
 │   └── server/
-│       ├── handler.go         # thin HTTP handlers (ingest, query, stats, pprof)
+│       ├── handler.go         # thin HTTP handlers (ingest, query, stats, ui, pprof)
 │       ├── middleware.go      # recover, request id, logging, rate limiting
+│       ├── authmw.go          # auth + RBAC middleware
 │       ├── server.go          # http.Server + graceful lifecycle
 │       ├── grpcserver/        # gRPC service, interceptors, lifecycle
 │       ├── pipeline/          # channel pipeline: stages, worker pools, self-stats
 │       ├── storage/           # TSDB: series/index/query + memory, bolt, tsdb backends
+│       ├── live/              # from-scratch WebSocket + broadcast hub (live dashboard)
 │       └── ratelimit/         # per-agent token-bucket limiter
+├── web/                       # embedded dashboard SPA (go:embed)
 └── pkg/
     └── httpx/client.go        # reusable HTTP client with retry + backoff
 ```
@@ -148,6 +151,23 @@ grpcurl -plaintext -d '{"name":"cpu_usage_percent"}' \
 Regenerate the protobuf/gRPC code after editing the `.proto` with
 `make proto-tools` (once) then `make proto` (or `go generate ./...`).
 
+## Live dashboard
+
+The server embeds a single-page dashboard (via `go:embed`) at `/` and pushes
+live updates over a WebSocket implemented from scratch (RFC 6455 — no
+third-party library). Enabled by default; disable with `-ui=false`.
+
+```bash
+./bin/server                 # open http://localhost:8080/
+./bin/agent                  # feed it some metrics
+```
+
+The dashboard shows a live metric feed and (for admin/no-auth) the pipeline &
+storage counters with a small chart. When auth is on, the WebSocket takes the
+credential from a field in the page (sent as a query param, since browsers can't
+set headers on a WS handshake) and the live stream is **tenant-scoped** — a
+tenant only ever sees its own metrics, and stats are admin-only.
+
 ## Authentication & multi-tenancy
 
 Auth is **off by default** (single-tenant, open). Enable it with `-auth` plus at
@@ -223,6 +243,7 @@ Priority: defaults → environment variables → flags.
 - `-jwt-hs256-secret` / `JWT_HS256_SECRET` — HS256 shared secret for JWT auth
 - `-jwks-url` / `JWKS_URL` — JWKS endpoint for RS256 JWT auth
 - `-jwt-issuer` / `JWT_ISSUER`, `-jwt-audience` / `JWT_AUDIENCE` — required claims (optional)
+- `-ui` / `UI` — serve the embedded live dashboard at `/` (default `true`)
 
 ### Agent
 
@@ -263,3 +284,5 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
 - **v0.5.0** — Authentication & multi-tenancy: API keys and from-scratch JWT
   (HS256/RS256 + JWKS rotation), RBAC, and per-tenant data isolation enforced on
   both transports; auth off by default.
+- **v0.6.0** — Embedded live dashboard: a `go:embed` SPA and a from-scratch
+  WebSocket pushing tenant-scoped live metrics and (admin) stats.

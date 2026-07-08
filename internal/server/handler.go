@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
@@ -14,8 +15,10 @@ import (
 
 	"metrics-system/internal/auth"
 	"metrics-system/internal/model"
+	"metrics-system/internal/server/live"
 	"metrics-system/internal/server/pipeline"
 	"metrics-system/internal/server/storage"
+	"metrics-system/web"
 )
 
 // Handler is a thin HTTP layer: ingestion feeds the pipeline, reads go straight
@@ -24,6 +27,11 @@ type Handler struct {
 	pipeline *pipeline.Pipeline
 	storage  storage.Storage
 	logger   *slog.Logger
+
+	// UI (optional): set via SetUI. When hub is non-nil the dashboard and its
+	// WebSocket are served.
+	hub   *live.Hub
+	authn auth.Authenticator
 }
 
 // NewHandler wires the handler to its pipeline and storage.
@@ -32,6 +40,13 @@ func NewHandler(p *pipeline.Pipeline, store storage.Storage, logger *slog.Logger
 		logger = slog.Default()
 	}
 	return &Handler{pipeline: p, storage: store, logger: logger}
+}
+
+// SetUI enables the embedded dashboard. authn (may be nil = auth off) is used to
+// authenticate and tenant-scope the WebSocket stream. Call before Routes.
+func (h *Handler) SetUI(hub *live.Hub, authn auth.Authenticator) {
+	h.hub = hub
+	h.authn = authn
 }
 
 // Routes builds the mux with the API, health, self-stats and pprof endpoints.
@@ -48,7 +63,60 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+
+	// Embedded dashboard + live WebSocket (only when enabled via SetUI).
+	if h.hub != nil {
+		sub, _ := fs.Sub(web.FS, "static")
+		mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
+		mux.HandleFunc("GET /{$}", h.index)
+		mux.HandleFunc("GET /ws", h.ws)
+	}
 	return mux
+}
+
+// index serves the dashboard shell.
+func (h *Handler) index(w http.ResponseWriter, _ *http.Request) {
+	data, err := web.FS.ReadFile("static/index.html")
+	if err != nil {
+		http.Error(w, "ui unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
+// ws authenticates (when auth is on) and upgrades to a WebSocket, registering
+// the connection with the live hub scoped to the caller's tenant.
+func (h *Handler) ws(w http.ResponseWriter, r *http.Request) {
+	tenant, admin, ok := h.authorizeWS(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	conn, err := live.Upgrade(w, r)
+	if err != nil {
+		h.logger.Debug("ws upgrade failed", "error", err)
+		return
+	}
+	h.hub.Add(conn, tenant, admin)
+}
+
+// authorizeWS resolves the WebSocket caller. Browsers can't set custom headers
+// on the WS handshake, so credentials come from query params (?token / ?api_key).
+// Auth off => unrestricted view (may see stats).
+func (h *Handler) authorizeWS(r *http.Request) (tenant string, admin, ok bool) {
+	if h.authn == nil {
+		return "", true, true
+	}
+	q := r.URL.Query()
+	principal, err := h.authn.Authenticate(r.Context(), auth.Credentials{
+		APIKey: q.Get("api_key"),
+		Bearer: q.Get("token"),
+	})
+	if err != nil || !principal.Can(auth.ActionQuery) {
+		return "", false, false
+	}
+	return principal.Tenant, principal.Can(auth.ActionAdmin), true
 }
 
 func (h *Handler) ingest(w http.ResponseWriter, r *http.Request) {

@@ -50,10 +50,19 @@ type Pipeline struct {
 	stats   *Stats
 	cfg     Config
 
+	// onStored, if set, is called with each batch of just-stored metrics (used
+	// by the live dashboard). Set before Start. The callback must copy the slice
+	// if it retains it — the pipeline reuses the backing array.
+	onStored func([]model.Metric)
+
 	startOnce sync.Once
 	stopOnce  sync.Once
 	wg        sync.WaitGroup
 }
+
+// SetObserver registers a callback invoked with each batch of stored metrics.
+// It must be called before Start.
+func (p *Pipeline) SetObserver(f func([]model.Metric)) { p.onStored = f }
 
 // New builds a pipeline. cfg zero-values are replaced with sensible defaults.
 func New(store storage.Storage, cfg Config, logger *slog.Logger) *Pipeline {
