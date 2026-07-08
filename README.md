@@ -5,6 +5,9 @@ Prometheus-like stack). The Go module is `metrics-system`; it ships two
 binaries — an **agent** that collects host metrics and a **server** that
 ingests, stores and serves them.
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the internals and
+[SCENARIOS.md](SCENARIOS.md) for end-to-end usage flows.
+
 ## Architecture
 
 ```text
