@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 // errSenderClosed is returned by Send after Close.
@@ -27,6 +28,7 @@ type GRPCSender struct {
 	conn   *grpc.ClientConn
 	client metricspb.MetricsServiceClient
 	logger *slog.Logger
+	creds  Credentials
 
 	mu           sync.Mutex
 	stream       metricspb.MetricsService_IngestStreamClient
@@ -36,7 +38,7 @@ type GRPCSender struct {
 
 // NewGRPCSender dials target (a host:port, not a URL) with an insecure
 // connection. The dial is lazy; the first Send establishes the stream.
-func NewGRPCSender(target string, logger *slog.Logger) (*GRPCSender, error) {
+func NewGRPCSender(target string, creds Credentials, logger *slog.Logger) (*GRPCSender, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -48,6 +50,7 @@ func NewGRPCSender(target string, logger *slog.Logger) (*GRPCSender, error) {
 		conn:   conn,
 		client: metricspb.NewMetricsServiceClient(conn),
 		logger: logger,
+		creds:  creds,
 	}, nil
 }
 
@@ -110,7 +113,7 @@ func (s *GRPCSender) ensureStreamLocked() (metricspb.MetricsService_IngestStream
 	// The stream must outlive individual ticks, so it is rooted in a background
 	// context we own and cancel on reset/close — not the per-tick ctx.
 	streamCtx, cancel := context.WithCancel(context.Background())
-	stream, err := s.client.IngestStream(streamCtx)
+	stream, err := s.client.IngestStream(s.withCredentials(streamCtx))
 	if err != nil {
 		cancel()
 		return nil, err
@@ -118,6 +121,22 @@ func (s *GRPCSender) ensureStreamLocked() (metricspb.MetricsService_IngestStream
 	s.stream = stream
 	s.streamCancel = cancel
 	return stream, nil
+}
+
+// withCredentials attaches the configured API key / bearer token as outgoing
+// gRPC metadata for the stream.
+func (s *GRPCSender) withCredentials(ctx context.Context) context.Context {
+	var kv []string
+	if s.creds.APIKey != "" {
+		kv = append(kv, "x-api-key", s.creds.APIKey)
+	}
+	if s.creds.Bearer != "" {
+		kv = append(kv, "authorization", "Bearer "+s.creds.Bearer)
+	}
+	if len(kv) == 0 {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, kv...)
 }
 
 // resetStreamLocked tears down the current stream so the next Send reopens one.

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"time"
 
+	"metrics-system/internal/auth"
 	"metrics-system/internal/grpcconv"
 	"metrics-system/internal/model"
 	metricspb "metrics-system/internal/proto/metricspb"
@@ -50,13 +51,16 @@ func NewService(ingester Ingester, reader Reader, logger *slog.Logger) *Service 
 
 // Ingest handles a single batch (unary). Saturation is reported as
 // ResourceExhausted — the gRPC analogue of the HTTP 503 backpressure signal.
-func (s *Service) Ingest(_ context.Context, pb *metricspb.Batch) (*metricspb.IngestAck, error) {
+func (s *Service) Ingest(ctx context.Context, pb *metricspb.Batch) (*metricspb.IngestAck, error) {
 	batch, err := grpcconv.BatchFromProto(pb)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "convert batch: %v", err)
 	}
 	if err := batch.Validate(); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if p, ok := auth.FromContext(ctx); ok {
+		batch.Tenant = p.Tenant
 	}
 	if !s.ingester.Ingest(batch) {
 		return nil, status.Error(codes.ResourceExhausted, "pipeline overloaded")
@@ -70,6 +74,11 @@ func (s *Service) Ingest(_ context.Context, pb *metricspb.Batch) (*metricspb.Ing
 // stream. A malformed or invalid batch is acked with accepted=0 and the stream
 // stays open.
 func (s *Service) IngestStream(stream grpc.BidiStreamingServer[metricspb.Batch, metricspb.IngestAck]) error {
+	// The principal (and its tenant) is fixed for the life of the stream.
+	tenant := ""
+	if p, ok := auth.FromContext(stream.Context()); ok {
+		tenant = p.Tenant
+	}
 	for {
 		pb, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -84,6 +93,7 @@ func (s *Service) IngestStream(stream grpc.BidiStreamingServer[metricspb.Batch, 
 		case cerr != nil:
 			s.logger.Warn("grpc ingest stream: malformed batch", "error", cerr)
 		default:
+			batch.Tenant = tenant
 			if verr := batch.Validate(); verr != nil {
 				s.logger.Warn("grpc ingest stream: invalid batch", "error", verr)
 			} else if s.ingester.Ingest(batch) {
@@ -105,6 +115,13 @@ func (s *Service) Query(pb *metricspb.QueryRequest, stream grpc.ServerStreamingS
 	q, err := queryFromProto(pb)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Enforce tenant isolation, overriding any client-supplied tenant filter.
+	if p, ok := auth.FromContext(stream.Context()); ok && p.Tenant != "" {
+		if q.Labels == nil {
+			q.Labels = make(map[string]string, 1)
+		}
+		q.Labels["tenant"] = p.Tenant
 	}
 	results, err := s.reader.Query(q)
 	if err != nil {

@@ -14,18 +14,27 @@ import (
 	"metrics-system/pkg/httpx"
 )
 
+// Credentials are the optional auth material the agent presents to the server.
+// At most one is normally set; both are attached when present.
+type Credentials struct {
+	APIKey string // sent as X-API-Key / x-api-key metadata
+	Bearer string // sent as "Authorization: Bearer <token>"
+}
+
 type Sender struct {
 	endpoint string
 	client   *httpx.Client
+	creds    Credentials
 }
 
-func NewSender(endpoint string, client *httpx.Client) *Sender {
+func NewSender(endpoint string, client *httpx.Client, creds Credentials) *Sender {
 	if client == nil {
 		client = httpx.NewClient(10*time.Second, 2, 200*time.Millisecond)
 	}
 	return &Sender{
 		endpoint: strings.TrimSpace(endpoint),
 		client:   client,
+		creds:    creds,
 	}
 }
 
@@ -45,6 +54,12 @@ func (s *Sender) Send(ctx context.Context, batch model.Batch) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-ID", batch.AgentID)
+	if s.creds.APIKey != "" {
+		req.Header.Set("X-API-Key", s.creds.APIKey)
+	}
+	if s.creds.Bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+s.creds.Bearer)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

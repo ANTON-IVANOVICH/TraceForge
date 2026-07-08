@@ -1,4 +1,6 @@
 /bin/
+/server
+/agent
 /.cache/
 /dist/
 /data/

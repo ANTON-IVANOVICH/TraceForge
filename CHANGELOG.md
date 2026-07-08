@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-09
+
+Authentication, role-based access control and multi-tenant data isolation across
+both transports. Auth is off by default (backward compatible).
+
+### Added
+
+- `internal/auth`: authenticated `Principal` (subject, tenant, roles) carried
+  through `context.Context`, plus an `Authenticator` chain.
+- API-key authentication: `{subject, tenant, roles}` mapping loaded from a JSON
+  file (`-api-keys`); keys stored only as SHA-256 hashes and resolved by hash.
+- JWT bearer authentication implemented from scratch on the standard library
+  (no third-party JWT lib): HS256 (`-jwt-hs256-secret`) and RS256 via a rotating
+  JWKS key set (`-jwks-url`). The verifier is pinned to one algorithm (rejecting
+  `none` and RS256→HS256 confusion); `exp` is mandatory; `nbf`/`iss`/`aud`
+  validated; JWKS rejects sub-2048-bit RSA keys and refreshes on rotation.
+- RBAC: roles `writer`/`reader`/`admin` grant actions ingest/query/admin, checked
+  by an HTTP middleware and gRPC interceptors (unary + stream).
+- Multi-tenancy: a server-assigned `tenant` label (never client-settable) is
+  stamped on ingest and forced as a filter on every query, isolating series per
+  tenant.
+- Server flags `-auth`, `-api-keys`, `-jwt-hs256-secret`, `-jwks-url`,
+  `-jwt-issuer`, `-jwt-audience`; agent flags `-api-key`, `-auth-token`.
+- Tests: JWT (HS256/RS256, expiry, alg-confusion, issuer/audience), JWKS fetch +
+  rotation + weak-key rejection, API keys, RBAC, and tenant-isolation E2E over
+  both HTTP and gRPC.
+
+### Changed
+
+- The agent ships credentials via a `Credentials` value on both senders (HTTP
+  headers / gRPC metadata).
+- `model.Batch` gained a server-only `Tenant` field (`json:"-"`).
+
+### Dependencies
+
+- No new modules (auth is built on the standard library and existing gRPC deps).
+
 ## [0.4.0] - 2026-07-05
 
 A gRPC + Protocol Buffers transport between agent and server, alongside HTTP.
@@ -158,7 +195,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.1.0...v0.2.0

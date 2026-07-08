@@ -148,7 +148,7 @@ func (sumAgg) Aggregate(p []Point) float64 {
 
 type countAgg struct{}
 
-func (countAgg) Name() string { return "count" }
+func (countAgg) Name() string                { return "count" }
 func (countAgg) Aggregate(p []Point) float64 { return float64(len(p)) }
 
 // percentileAgg computes the p-quantile via nearest-rank on the sorted values.

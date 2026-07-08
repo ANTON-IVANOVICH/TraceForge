@@ -87,7 +87,7 @@ func TestGRPCSenderStreamsBatches(t *testing.T) {
 	t.Parallel()
 	stub, addr := startStub(t)
 
-	sender, err := NewGRPCSender(addr, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sender, err := NewGRPCSender(addr, Credentials{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new sender: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestGRPCSenderThrottleIsNotAnError(t *testing.T) {
 	stub, addr := startStub(t)
 	stub.setThrottle(true)
 
-	sender, err := NewGRPCSender(addr, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sender, err := NewGRPCSender(addr, Credentials{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new sender: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestGRPCSenderThrottleIsNotAnError(t *testing.T) {
 func TestGRPCSenderRejectsInvalidBatch(t *testing.T) {
 	t.Parallel()
 	_, addr := startStub(t)
-	sender, err := NewGRPCSender(addr, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sender, err := NewGRPCSender(addr, Credentials{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new sender: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestGRPCSenderRejectsInvalidBatch(t *testing.T) {
 func TestGRPCSenderClosedSenderRejects(t *testing.T) {
 	t.Parallel()
 	_, addr := startStub(t)
-	sender, err := NewGRPCSender(addr, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sender, err := NewGRPCSender(addr, Credentials{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new sender: %v", err)
 	}

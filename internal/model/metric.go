@@ -89,9 +89,14 @@ type Metric struct {
 }
 
 // Batch is a packet of metrics from one agent.
+//
+// Tenant is set server-side from the authenticated principal, never read from
+// the wire (json:"-", and the protobuf Batch has no such field) — a client must
+// not be able to choose the tenant its data lands in.
 type Batch struct {
 	AgentID string   `json:"agent_id"`
 	Metrics []Metric `json:"metrics"`
+	Tenant  string   `json:"-"`
 }
 
 func (m Metric) Validate() error {

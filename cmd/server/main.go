@@ -13,7 +13,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"metrics-system/internal/auth"
 	"metrics-system/internal/server"
 	"metrics-system/internal/server/grpcserver"
 	"metrics-system/internal/server/pipeline"
@@ -41,22 +43,32 @@ func main() {
 		StoreWorkers:    cfg.storeWorkers,
 	}, logger)
 
+	// Build the authenticator (nil when auth is disabled — the default).
+	authn, keySets, err := buildAuthenticator(cfg, logger)
+	if err != nil {
+		logger.Error("auth setup failed", "error", err)
+		os.Exit(1)
+	}
+
 	limiter := ratelimit.New(cfg.rateLimitRPS, cfg.rateLimitBurst)
 	handler := server.NewHandler(pipe, store, logger)
-	routes := server.Chain(
-		handler.Routes(),
-		server.Recover(logger), // outermost: catches panics from everything below
+	// Recover (outer) -> request id -> logging -> rate limit -> [auth] -> handler.
+	mws := []server.Middleware{
+		server.Recover(logger),
 		server.RequestID,
 		server.Logger(logger),
 		server.RateLimit(limiter),
-	)
-	srv := server.New(cfg.addr, routes, logger)
+	}
+	if authn != nil {
+		mws = append(mws, server.Authenticate(authn, logger))
+	}
+	srv := server.New(cfg.addr, server.Chain(handler.Routes(), mws...), logger)
 
-	// Optional gRPC transport, sharing the same pipeline and store as HTTP.
+	// Optional gRPC transport, sharing the same pipeline, store and auth as HTTP.
 	var grpcSrv *grpcserver.Server
 	if cfg.grpcAddr != "" {
 		svc := grpcserver.NewService(pipe, store, logger)
-		grpcSrv, err = grpcserver.New(cfg.grpcAddr, svc, logger)
+		grpcSrv, err = grpcserver.New(cfg.grpcAddr, svc, authn, logger)
 		if err != nil {
 			logger.Error("grpc listen failed", "addr", cfg.grpcAddr, "error", err)
 			os.Exit(1)
@@ -69,6 +81,11 @@ func main() {
 	defer stopSignals()
 	ctx, cancel := context.WithCancel(sigCtx)
 	defer cancel()
+
+	// Periodic JWKS refresh for RS256 key rotation.
+	for _, ks := range keySets {
+		go ks.Refresh(ctx, logger)
+	}
 
 	pipe.Start()
 
@@ -135,6 +152,62 @@ func openStorage(cfg config, logger *slog.Logger) (storage.Storage, error) {
 	}
 }
 
+// buildAuthenticator assembles the auth Chain from config. It returns a nil
+// authenticator when auth is disabled (fully backward compatible), plus any
+// JWKS key sets whose background refresh the caller should start.
+func buildAuthenticator(cfg config, logger *slog.Logger) (auth.Authenticator, []*auth.KeySet, error) {
+	if !cfg.authEnabled {
+		return nil, nil, nil
+	}
+
+	var opts []auth.VerifierOption
+	if cfg.jwtIssuer != "" {
+		opts = append(opts, auth.WithIssuer(cfg.jwtIssuer))
+	}
+	if cfg.jwtAudience != "" {
+		opts = append(opts, auth.WithAudience(cfg.jwtAudience))
+	}
+
+	var chain auth.Chain
+	var keySets []*auth.KeySet
+
+	if cfg.apiKeysFile != "" {
+		akCfg, err := auth.LoadAPIKeyConfig(cfg.apiKeysFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load api keys: %w", err)
+		}
+		ak, err := auth.NewAPIKeyAuthenticator(akCfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("api keys: %w", err)
+		}
+		chain = append(chain, ak)
+		logger.Info("auth: api keys enabled", "count", len(akCfg.Keys))
+	}
+	if cfg.jwtHS256 != "" {
+		v, err := auth.NewHS256Verifier([]byte(cfg.jwtHS256), opts...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("hs256: %w", err)
+		}
+		chain = append(chain, auth.NewJWTAuthenticator(v))
+		logger.Info("auth: HS256 JWT enabled")
+	}
+	if cfg.jwksURL != "" {
+		ks := auth.NewKeySet(cfg.jwksURL, 5*time.Minute)
+		v, err := auth.NewRS256Verifier(ks, opts...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rs256: %w", err)
+		}
+		chain = append(chain, auth.NewJWTAuthenticator(v))
+		keySets = append(keySets, ks)
+		logger.Info("auth: RS256 JWT (JWKS) enabled", "url", cfg.jwksURL)
+	}
+
+	if len(chain) == 0 {
+		return nil, nil, fmt.Errorf("auth enabled but no method configured (set -api-keys, -jwt-hs256-secret or -jwks-url)")
+	}
+	return chain, keySets, nil
+}
+
 // config holds the resolved server settings. Priority: defaults -> env -> flags.
 type config struct {
 	addr            string
@@ -148,6 +221,13 @@ type config struct {
 	storeWorkers    int
 	rateLimitRPS    float64
 	rateLimitBurst  int
+
+	authEnabled bool
+	apiKeysFile string
+	jwtHS256    string
+	jwksURL     string
+	jwtIssuer   string
+	jwtAudience string
 }
 
 func loadConfig() config {
@@ -163,6 +243,12 @@ func loadConfig() config {
 		storeWorkers:    envInt("STORE_WORKERS", 1),
 		rateLimitRPS:    envFloat("RATE_LIMIT_RPS", 100),
 		rateLimitBurst:  envInt("RATE_LIMIT_BURST", 200),
+		authEnabled:     envBool("AUTH", false),
+		apiKeysFile:     envString("API_KEYS_FILE", ""),
+		jwtHS256:        envString("JWT_HS256_SECRET", ""),
+		jwksURL:         envString("JWKS_URL", ""),
+		jwtIssuer:       envString("JWT_ISSUER", ""),
+		jwtAudience:     envString("JWT_AUDIENCE", ""),
 	}
 
 	flag.StringVar(&cfg.addr, "addr", cfg.addr, "HTTP listen address")
@@ -176,6 +262,12 @@ func loadConfig() config {
 	flag.IntVar(&cfg.storeWorkers, "store-workers", cfg.storeWorkers, "number of store workers")
 	flag.Float64Var(&cfg.rateLimitRPS, "rate-limit-rps", cfg.rateLimitRPS, "per-agent requests per second")
 	flag.IntVar(&cfg.rateLimitBurst, "rate-limit-burst", cfg.rateLimitBurst, "per-agent burst")
+	flag.BoolVar(&cfg.authEnabled, "auth", cfg.authEnabled, "enable authentication + RBAC + tenant isolation")
+	flag.StringVar(&cfg.apiKeysFile, "api-keys", cfg.apiKeysFile, "path to API-keys JSON file")
+	flag.StringVar(&cfg.jwtHS256, "jwt-hs256-secret", cfg.jwtHS256, "HS256 shared secret for JWT auth")
+	flag.StringVar(&cfg.jwksURL, "jwks-url", cfg.jwksURL, "JWKS URL for RS256 JWT auth")
+	flag.StringVar(&cfg.jwtIssuer, "jwt-issuer", cfg.jwtIssuer, "required JWT issuer (optional)")
+	flag.StringVar(&cfg.jwtAudience, "jwt-audience", cfg.jwtAudience, "required JWT audience (optional)")
 	flag.Parse()
 
 	return cfg
@@ -200,6 +292,18 @@ func envString(key, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func envBool(key string, fallback bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
 
 func envInt(key string, fallback int) int {

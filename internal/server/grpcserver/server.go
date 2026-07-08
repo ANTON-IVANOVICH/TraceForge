@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"metrics-system/internal/auth"
 	metricspb "metrics-system/internal/proto/metricspb"
 
 	"google.golang.org/grpc"
@@ -26,8 +27,10 @@ type Server struct {
 }
 
 // New binds a listener on addr and registers the MetricsService with recovery
-// and logging interceptors plus server reflection (for grpcurl).
-func New(addr string, svc metricspb.MetricsServiceServer, logger *slog.Logger) (*Server, error) {
+// and logging interceptors plus server reflection (for grpcurl). When
+// authenticator is non-nil, auth/RBAC interceptors are added (innermost, so the
+// logging interceptor still records rejected calls).
+func New(addr string, svc metricspb.MetricsServiceServer, authenticator auth.Authenticator, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -35,10 +38,18 @@ func New(addr string, svc metricspb.MetricsServiceServer, logger *slog.Logger) (
 	if err != nil {
 		return nil, err
 	}
+
+	// recover (outermost) -> log -> [auth] -> handler.
+	unary := []grpc.UnaryServerInterceptor{recoverUnary(logger), logUnary(logger)}
+	stream := []grpc.StreamServerInterceptor{recoverStream(logger), logStream(logger)}
+	if authenticator != nil {
+		unary = append(unary, authUnary(authenticator))
+		stream = append(stream, authStream(authenticator))
+	}
+
 	gs := grpc.NewServer(
-		// recover is outermost so it also catches panics from logging.
-		grpc.ChainUnaryInterceptor(recoverUnary(logger), logUnary(logger)),
-		grpc.ChainStreamInterceptor(recoverStream(logger), logStream(logger)),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
 	)
 	metricspb.RegisterMetricsServiceServer(gs, svc)
 	reflection.Register(gs)

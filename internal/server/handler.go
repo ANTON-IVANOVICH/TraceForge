@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"metrics-system/internal/auth"
 	"metrics-system/internal/model"
 	"metrics-system/internal/server/pipeline"
 	"metrics-system/internal/server/storage"
@@ -71,6 +72,11 @@ func (h *Handler) ingest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Stamp the server-side tenant from the authenticated principal (if any),
+	// so the pipeline can isolate this data. No principal => single-tenant.
+	if p, ok := auth.FromContext(r.Context()); ok {
+		batch.Tenant = p.Tenant
+	}
 	if !h.pipeline.Ingest(batch) {
 		// Pipeline saturated: tell the client to back off.
 		w.Header().Set("Retry-After", "1")
@@ -85,6 +91,14 @@ func (h *Handler) query(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// Enforce tenant isolation: a tenant-scoped principal may only read its own
+	// series, overriding any client-supplied tenant filter.
+	if p, ok := auth.FromContext(r.Context()); ok && p.Tenant != "" {
+		if q.Labels == nil {
+			q.Labels = make(map[string]string, 1)
+		}
+		q.Labels["tenant"] = p.Tenant
 	}
 	result, err := h.storage.Query(q)
 	if err != nil {

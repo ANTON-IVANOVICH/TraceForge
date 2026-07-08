@@ -32,7 +32,7 @@ func TestSenderSend(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	sender := NewSender(srv.URL, httpx.NewClient(2*time.Second, 0, 50*time.Millisecond))
+	sender := NewSender(srv.URL, httpx.NewClient(2*time.Second, 0, 50*time.Millisecond), Credentials{})
 	batch := model.Batch{
 		AgentID: "test-agent",
 		Metrics: []model.Metric{{
@@ -60,7 +60,7 @@ func TestSenderRetriesOnServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	sender := NewSender(srv.URL, httpx.NewClient(2*time.Second, 2, 10*time.Millisecond))
+	sender := NewSender(srv.URL, httpx.NewClient(2*time.Second, 2, 10*time.Millisecond), Credentials{})
 	batch := model.Batch{
 		AgentID: "retry-agent",
 		Metrics: []model.Metric{{

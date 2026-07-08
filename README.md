@@ -42,6 +42,7 @@ agent(s) ─────┤                            ├──► server
 ├── internal/
 │   ├── agent/                 # collectors, HTTP sender, gRPC streaming sender
 │   ├── model/metric.go        # Metric, Batch, MetricType
+│   ├── auth/                  # API keys, JWT (HS256/RS256+JWKS), RBAC, tenant principal
 │   ├── grpcconv/              # model <-> protobuf conversion
 │   ├── proto/metricspb/       # generated protobuf + gRPC code (go generate)
 │   └── server/
@@ -144,6 +145,39 @@ grpcurl -plaintext -d '{"name":"cpu_usage_percent"}' \
 Regenerate the protobuf/gRPC code after editing the `.proto` with
 `make proto-tools` (once) then `make proto` (or `go generate ./...`).
 
+## Authentication & multi-tenancy
+
+Auth is **off by default** (single-tenant, open). Enable it with `-auth` plus at
+least one credential source; it then guards both the HTTP and gRPC transports.
+
+**Credentials** (the agent presents one; the server accepts any configured kind):
+
+- **API keys** — an `X-API-Key` header / `x-api-key` gRPC metadata. Keys map to a
+  `{subject, tenant, roles}` identity in a JSON file (`-api-keys`); keys are
+  stored only as SHA-256 hashes.
+- **JWT bearer** — `Authorization: Bearer <token>`. Verified from scratch on the
+  standard library, pinned to one algorithm: **HS256** (`-jwt-hs256-secret`) or
+  **RS256** via a rotating **JWKS** (`-jwks-url`). `exp` is mandatory; `-jwt-issuer`
+  / `-jwt-audience` are enforced when set. `tenant` and `roles`/`scope` claims map
+  to the principal.
+
+**RBAC** — roles grant actions: `writer`→ingest, `reader`→query, `admin`→all
+(incl. `/debug/*`). A missing credential is `401`/`Unauthenticated`; a valid one
+lacking the role is `403`/`PermissionDenied`.
+
+**Multi-tenancy** — the server stamps each ingested metric with a server-side
+`tenant` label taken from the authenticated principal (clients cannot set or
+spoof it), and forces `tenant=<caller>` onto every query, so a tenant can only
+ever read its own series.
+
+```bash
+# api-keys.json: [{"key":"K1","subject":"web","tenant":"acme","roles":["writer"]}, ...]
+./bin/server -auth -api-keys=./api-keys.json -jwt-hs256-secret=$SECRET
+./bin/agent -api-key=K1                    # HTTP
+./bin/agent -transport=grpc -api-key=K1    # gRPC
+curl -H 'X-API-Key: K2' 'localhost:8080/api/v1/query?name=cpu_usage_percent'
+```
+
 ## Storage backends
 
 Pick the store with `-storage`; persistent backends keep data in `-data-dir`.
@@ -181,12 +215,19 @@ Priority: defaults → environment variables → flags.
 - `-store-workers` / `STORE_WORKERS` — store stage workers (default `1`)
 - `-rate-limit-rps` / `RATE_LIMIT_RPS` — per-agent requests/second (default `100`)
 - `-rate-limit-burst` / `RATE_LIMIT_BURST` — per-agent burst (default `200`)
+- `-auth` / `AUTH` — enable auth + RBAC + tenant isolation (default `false`)
+- `-api-keys` / `API_KEYS_FILE` — path to the API-keys JSON file
+- `-jwt-hs256-secret` / `JWT_HS256_SECRET` — HS256 shared secret for JWT auth
+- `-jwks-url` / `JWKS_URL` — JWKS endpoint for RS256 JWT auth
+- `-jwt-issuer` / `JWT_ISSUER`, `-jwt-audience` / `JWT_AUDIENCE` — required claims (optional)
 
 ### Agent
 
 - `-transport` / `AGENT_TRANSPORT` — `http` | `grpc` (default `http`)
 - `-server` / `AGENT_SERVER` — HTTP endpoint (default `http://localhost:8080/api/v1/metrics`)
 - `-grpc-server` / `AGENT_GRPC_SERVER` — gRPC target host:port (default `localhost:9090`)
+- `-api-key` / `AGENT_API_KEY` — API key to authenticate to the server
+- `-auth-token` / `AGENT_AUTH_TOKEN` — bearer (JWT) token to authenticate to the server
 - `-interval` / `AGENT_INTERVAL` — default `5s`
 - `-id` / `AGENT_ID` — default hostname
 - `-disk-path` / `AGENT_DISK_PATH` — default `/`
@@ -216,3 +257,6 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
 - **v0.4.0** — gRPC + Protocol Buffers transport alongside HTTP: unary,
   bidirectional-streaming and server-streaming RPCs feeding the same pipeline;
   agent `-transport=grpc`; recovery/logging interceptors and reflection.
+- **v0.5.0** — Authentication & multi-tenancy: API keys and from-scratch JWT
+  (HS256/RS256 + JWKS rotation), RBAC, and per-tenant data isolation enforced on
+  both transports; auth off by default.

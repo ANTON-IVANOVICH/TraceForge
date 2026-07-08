@@ -35,7 +35,7 @@ func newRealServer(t *testing.T) (metricspb.MetricsServiceClient, storage.Storag
 	pipe.Start()
 
 	svc := NewService(pipe, store, logger)
-	srv, err := New("127.0.0.1:0", svc, logger)
+	srv, err := New("127.0.0.1:0", svc, nil, logger)
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}

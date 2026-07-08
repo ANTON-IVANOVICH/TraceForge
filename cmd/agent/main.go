@@ -22,6 +22,8 @@ func main() {
 	defaultServer := envString("AGENT_SERVER", "http://localhost:8080/api/v1/metrics")
 	defaultTransport := envString("AGENT_TRANSPORT", "http")
 	defaultGRPCServer := envString("AGENT_GRPC_SERVER", "localhost:9090")
+	defaultAPIKey := envString("AGENT_API_KEY", "")
+	defaultAuthToken := envString("AGENT_AUTH_TOKEN", "")
 	defaultInterval := envDuration("AGENT_INTERVAL", 5*time.Second)
 	defaultID := envString("AGENT_ID", hostname)
 	defaultDiskPath := envString("AGENT_DISK_PATH", "/")
@@ -40,6 +42,8 @@ func main() {
 		httpTO        = flag.Duration("http-timeout", defaultTimeout, "http timeout")
 		httpRetry     = flag.Int("http-retries", defaultRetries, "http retry count")
 		httpBackof    = flag.Duration("http-backoff", defaultBackoff, "http retry base backoff")
+		apiKey        = flag.String("api-key", defaultAPIKey, "API key to authenticate to the server")
+		authToken     = flag.String("auth-token", defaultAuthToken, "bearer (JWT) token to authenticate to the server")
 		logLevel      = flag.String("log-level", defaultLevel, "log level: debug|info|warn|error")
 	)
 	flag.Parse()
@@ -53,7 +57,8 @@ func main() {
 		agent.NewUptimeCollector(hostname),
 	}
 
-	transport, err := buildTransport(*transportName, *serverURL, *grpcServer, *httpTO, *httpRetry, *httpBackof, logger)
+	creds := agent.Credentials{APIKey: *apiKey, Bearer: *authToken}
+	transport, err := buildTransport(*transportName, *serverURL, *grpcServer, *httpTO, *httpRetry, *httpBackof, creds, logger)
 	if err != nil {
 		logger.Error("build transport failed", "transport", *transportName, "error", err)
 		os.Exit(1)
@@ -70,15 +75,15 @@ func main() {
 }
 
 // buildTransport constructs the agent's Transport from the -transport choice.
-func buildTransport(name, serverURL, grpcTarget string, httpTO time.Duration, retries int, backoff time.Duration, logger *slog.Logger) (agent.Transport, error) {
+func buildTransport(name, serverURL, grpcTarget string, httpTO time.Duration, retries int, backoff time.Duration, creds agent.Credentials, logger *slog.Logger) (agent.Transport, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "http":
 		client := httpx.NewClient(httpTO, retries, backoff)
 		logger.Info("using HTTP transport", "server", serverURL)
-		return agent.NewSender(serverURL, client), nil
+		return agent.NewSender(serverURL, client, creds), nil
 	case "grpc":
 		logger.Info("using gRPC transport", "server", grpcTarget)
-		return agent.NewGRPCSender(grpcTarget, logger)
+		return agent.NewGRPCSender(grpcTarget, creds, logger)
 	default:
 		return nil, fmt.Errorf("unknown transport %q (want http|grpc)", name)
 	}

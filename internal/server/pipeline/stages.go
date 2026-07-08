@@ -22,9 +22,17 @@ func (p *Pipeline) unpackStage() {
 	for batch := range p.ingestCh {
 		for _, m := range batch.Metrics {
 			if m.Labels == nil {
-				m.Labels = make(map[string]string, 1)
+				m.Labels = make(map[string]string, 2)
 			}
 			m.Labels["agent_id"] = batch.AgentID
+			// tenant is a server-controlled label: set it from the authenticated
+			// principal and strip any client-supplied value, so a client can
+			// never write into another tenant. Empty when auth is disabled.
+			if batch.Tenant != "" {
+				m.Labels["tenant"] = batch.Tenant
+			} else {
+				delete(m.Labels, "tenant")
+			}
 			p.validateCh <- m
 		}
 	}
