@@ -1,9 +1,9 @@
 # TraceForge
 
 A distributed metrics collection and analysis system in Go (a simplified
-Prometheus-like stack). The Go module is `metrics-system`; it ships two
-binaries — an **agent** that collects host metrics and a **server** that
-ingests, stores and serves them.
+Prometheus-like stack). The Go module is `metrics-system`; it ships three
+binaries — an **agent** that collects host metrics, a **server** that ingests,
+stores, serves and alerts on them, and **metricsctl**, a command-line client.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the internals and
 [SCENARIOS.md](SCENARIOS.md) for end-to-end usage flows.
@@ -41,7 +41,8 @@ agent(s) ─────┤                            ├──► server
 ├── proto/metrics/v1/          # protobuf service + message definitions
 ├── cmd/
 │   ├── agent/main.go          # agent entry point (transport selection)
-│   └── server/main.go         # server entry point + config (HTTP + gRPC)
+│   ├── server/main.go         # server entry point + config (HTTP + gRPC)
+│   └── metricsctl/main.go     # CLI entry point (signals, exit codes)
 ├── internal/
 │   ├── agent/                 # collectors, HTTP sender, gRPC streaming sender
 │   ├── model/metric.go        # Metric, Batch, MetricType
@@ -49,6 +50,10 @@ agent(s) ─────┤                            ├──► server
 │   ├── clock/                 # injectable time (Real + Fake) for deterministic tests
 │   ├── grpcconv/              # model <-> protobuf conversion
 │   ├── proto/metricspb/       # generated protobuf + gRPC code (go generate)
+│   ├── cli/                   # metricsctl: cobra command tree, contexts, printers
+│   │   ├── config/            # ~/.metricsctl/config.yaml: contexts + credentials
+│   │   ├── client/            # HTTP client for the server API
+│   │   └── output/            # table/json/yaml/name printers, TTY + NO_COLOR
 │   ├── alerting/
 │   │   ├── service.go         # assembly + tenant-scoped rules/alerts/silences API
 │   │   ├── rules/             # PromQL-lite DSL (lexer, parser, AST), evaluator, scheduler
@@ -78,7 +83,7 @@ agent(s) ─────┤                            ├──► server
 
 ```bash
 make tidy
-make build          # -> bin/server, bin/agent
+make build          # -> bin/server, bin/agent, bin/metricsctl
 make test           # go test -race -cover ./...
 ```
 
@@ -278,6 +283,74 @@ With `-auth` on, everything is tenant-scoped: a rule evaluates only against its
 own tenant's series, and a tenant can never see another's rules, alerts or
 silences. Reads need the `query` action; creating or deleting needs `admin`.
 
+## CLI — `metricsctl`
+
+A kubectl-shaped client for the server. The shape is borrowed on purpose:
+`noun verb`, persistent flags, `-o json`, named contexts, shell completion.
+
+```bash
+make build            # -> bin/metricsctl
+make install-ctl      # or: go install ./cmd/metricsctl
+```
+
+**Contexts.** One binary addresses production and staging without editing
+anything in between. The config lives at `~/.metricsctl/config.yaml` (or
+`$XDG_CONFIG_HOME/metricsctl/`, or `$METRICSCTL_CONFIG`) and is written `0600`,
+because it holds credentials.
+
+```bash
+metricsctl config set-context local --server http://localhost:8080 --use
+metricsctl config set-context prod  --server https://metrics.example.com \
+                                    --token-file ~/.metricsctl/prod.token
+metricsctl config get-contexts
+metricsctl --context prod alerts list      # one-off, without switching
+```
+
+**Everything composes.** `-o table` for humans, `-o json` for `jq`, `-o yaml` to
+paste into a file, `-o name` for `xargs`:
+
+```bash
+metricsctl query cpu_usage_percent -l agent_id=web-1 --from -1h --agg avg --step 1m
+metricsctl alerts list --watch                     # refresh until Ctrl+C
+metricsctl alerts list -o json | jq '.[] | select(.state=="firing") | .labels'
+metricsctl rules list -o name | xargs -n1 metricsctl rules get -o yaml
+metricsctl agents list
+metricsctl stats
+```
+
+**Declarative rules.** `apply` is idempotent — `metadata.name` is the rule's
+stable id, so re-applying an unchanged file writes nothing:
+
+```bash
+metricsctl rules apply -f examples/alerting/rules.yaml --dry-run
+metricsctl rules apply -f examples/alerting/rules.yaml
+cat rules.yaml | metricsctl rules apply -f -
+metricsctl rules preview 'cpu_usage_percent > 80' --from -1h --step 1m   # backtest
+```
+
+**Silences.**
+
+```bash
+metricsctl silences create -m agent_id=web-1 --duration 2h --comment "maintenance"
+metricsctl silences list
+metricsctl silences delete <id> --yes
+```
+
+**Exit codes are the contract**, so `metricsctl rules get foo || handle_missing`
+works: `0` success, `1` generic failure, `2` usage error, `3` authentication or
+authorization, `4` not found.
+
+**Terminal manners.** Colour only on a real terminal, never in a pipe or a file,
+and `NO_COLOR` (see [no-color.org](https://no-color.org)) or `--no-color` always
+wins. A destructive command refuses to proceed unattended without `--yes`.
+
+**Shell completion** is dynamic — `metricsctl rules get <TAB>` asks the server
+which rules exist:
+
+```bash
+source <(metricsctl completion bash)     # or zsh|fish|powershell
+```
+
 ## Storage backends
 
 Pick the store with `-storage`; persistent backends keep data in `-data-dir`.
@@ -374,3 +447,7 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
   HMAC-signed webhooks, retry with exponential backoff + jitter and a circuit
   breaker per receiver; a tenant-scoped rules/alerts/silences API and an alerts
   panel on the dashboard. Off by default.
+- **v0.8.0** — `metricsctl`, a kubectl-shaped CLI on Cobra: named contexts with
+  `0600` credentials, `table|json|yaml|name` output, declarative idempotent
+  `rules apply -f`, `alerts list --watch`, silences, dynamic shell completion,
+  TTY/`NO_COLOR` manners, and POSIX exit codes.

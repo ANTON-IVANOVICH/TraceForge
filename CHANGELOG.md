@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-09
+
+`metricsctl`: a command-line client. Until now every interaction went through
+curl or the browser, which is fine for a demo and useless for operating a
+system. A CLI is a UI — if it is good, people use the product; if it is bad,
+they wrap it in scripts and suffer. This one borrows kubectl's shape on purpose.
+
+### Added
+
+- `cmd/metricsctl` + `internal/cli`: a Cobra command tree — `query`, `stats`,
+  `rules` (list/get/apply/preview/delete), `alerts list [--watch]`, `silences`
+  (list/create/delete), `agents list`, `config`, `completion`, `version`.
+- **Named contexts** (`internal/cli/config`), kubectl-style: one binary
+  addresses production and staging without an edit in between. The file lives at
+  `$METRICSCTL_CONFIG`, `$XDG_CONFIG_HOME/metricsctl/config.yaml` or
+  `~/.metricsctl/config.yaml`, supports `${VAR}` expansion and `token-file`
+  indirection, resolves `~` and config-relative paths, and is written `0600`.
+  `metricsctl config view` redacts credentials unless `--show-secrets`.
+- **Output formats** (`internal/cli/output`): `table` (hand-aligned, upper-cased
+  headers, colour-aware column widths), `json` and `yaml` (which encode the raw
+  API object, never the lossy table projection — a list stays a list), and `name`
+  (one identifier per line, for `xargs`). Chosen with `-o`.
+- **Declarative `rules apply -f`**: multi-document YAML, `-f -` for stdin,
+  `--dry-run`, and a diff-style `created`/`updated`/`unchanged` report.
+  `metadata.name` is the rule's stable id, so re-applying an unchanged file
+  writes nothing — safe to run from CI on every push. The manifest is the desired
+  state in full: a field it omits is reconciled back to the server's default,
+  including a `for` clause the expression itself carries. Rules are compiled
+  client-side before any request, so `--dry-run` catches a bad expression on the
+  update path too, where the server is never asked.
+- **`rules preview`**: backtest an expression over historical data before saving.
+- **`alerts list --watch`**: redraw on an interval, clean exit on Ctrl+C.
+- **Dynamic shell completion** for bash, zsh, fish and powershell:
+  `metricsctl rules get <TAB>` asks the server which rules exist.
+- **POSIX exit codes** as an API: `0` success, `1` generic, `2` usage, `3` auth,
+  `4` not found — so `metricsctl rules get foo || handle_missing` works. Cobra's
+  own argument and flag validation is wrapped so it exits `2`, an unknown or
+  mistyped (sub)command is a usage error rather than a help screen and a silent
+  `0`, and `rules apply` joins its per-rule failures so a `401` still exits `3`.
+- **`agents list`**, derived from a heartbeat metric (`uptime_seconds` by
+  default), because the server keeps no agent registry; documented as such.
+- `make build` now also builds `bin/metricsctl`, with the version injected via
+  `-ldflags -X main.version=$(git describe)`; `make install-ctl` installs it.
+- `examples/alerting/rules.yaml` — a manifest for `rules apply`.
+
+### Security
+
+- The config is written through a fresh temporary file and renamed into place, so
+  it is always `0600` and never half-written. (`os.WriteFile` applies its mode
+  only when it *creates* the file: rewriting an already world-readable config
+  would have left it world-readable with a new secret inside.) A loose-permissions
+  file is warned about on every invocation.
+- A context may configure exactly one credential, and `--api-key`/`--token`
+  *replace* the context's rather than adding to it — otherwise the context's API
+  key would ride along with the flag's bearer token to whatever `--server` now
+  points at.
+- Only the `${VAR}` placeholder form is expanded in the config. `os.ExpandEnv`
+  would also eat the bare `$VAR` form, silently truncating any credential that
+  contains a dollar sign.
+- Colour and interactive prompts require a real terminal, detected with the
+  terminal ioctl rather than the file mode — `/dev/null` is a character device
+  too, and treating it as a terminal would write escape codes into redirected
+  output and prompt where nobody can answer.
+- Destructive commands (`rules delete`, `silences delete`) refuse to run
+  unattended without `--yes`, instead of either hanging on a prompt or silently
+  proceeding.
+- `NO_COLOR` (see <https://no-color.org>) and `--no-color` always disable colour.
+
+### Dependencies
+
+- `github.com/spf13/cobra` — the point of this stage. Kept minimal otherwise:
+  Viper, go-pretty and survey are replaced by the standard library (a hand-written
+  table aligner and config loader, plain prompts), and `golang.org/x/term`
+  supplies the one thing the stdlib cannot, terminal detection.
+  `gopkg.in/yaml.v3` parses the config and rule manifests.
+
 ## [0.7.0] - 2026-07-09
 
 Alerting: the system stops being purely passive (store and show) and becomes
@@ -307,7 +383,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.4.0...v0.5.0

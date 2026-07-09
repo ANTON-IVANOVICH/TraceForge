@@ -4,13 +4,13 @@ A catalog of end-to-end flows the system supports, written as runnable recipes.
 This file is maintained alongside the staged roadmap: each milestone that adds a
 user-visible capability also adds or updates the relevant scenarios here.
 
-- **Covers up to:** v0.7.0 (alerting)
+- **Covers up to:** v0.8.0 (metricsctl CLI)
 - **Last updated:** 2026-07-09
 
 Conventions used below:
 
 - Server listens on HTTP `:8080` and gRPC `:9090` by default.
-- Build once with `make build` → `bin/server`, `bin/agent`.
+- Build once with `make build` → `bin/server`, `bin/agent`, `bin/metricsctl`.
 - `$` lines are shell; responses are abbreviated.
 
 ---
@@ -443,7 +443,184 @@ tenant-a's rule ID — `404` rather than `403`, so IDs cannot be probed.
 
 ---
 
-## 8. Failure & edge flows
+## 8. The CLI — `metricsctl`
+
+### 8.1 First run
+
+```bash
+make build                                # -> bin/metricsctl
+./bin/metricsctl config set-context local --server http://localhost:8080 --use
+./bin/metricsctl config get-contexts
+./bin/metricsctl stats
+```
+
+**Expected:** the config is created at `~/.metricsctl/config.yaml` with mode
+`0600`. If it is ever loosened, every invocation warns — it holds credentials.
+
+### 8.2 Several deployments, one binary
+
+```yaml
+# ~/.metricsctl/config.yaml
+current-context: local
+contexts:
+  local:
+    server: http://localhost:8080
+  prod:
+    server: https://metrics.example.com
+    ca-file: ~/.metricsctl/prod-ca.pem
+    auth:
+      token-file: ~/.metricsctl/prod.token     # or: token: ${METRICSCTL_TOKEN}
+```
+
+```bash
+metricsctl --context prod alerts list      # one-off, without switching
+metricsctl config use-context prod         # or switch for good
+metricsctl config view                     # credentials print as REDACTED
+```
+
+`${VAR}` in the config is expanded from the environment, so a checked-in config
+carries placeholders rather than secrets. `~` and config-relative paths resolve.
+
+### 8.3 Query metrics
+
+```bash
+metricsctl query cpu_usage_percent
+metricsctl query cpu_usage_percent -l agent_id=web-1 --from -1h --agg avg --step 1m
+metricsctl query cpu_usage_percent -o json | jq '.[].value'
+```
+
+`--from`/`--to` accept RFC3339 or a relative offset (`-1h`, `-30m`, `now`).
+
+### 8.4 Output formats compose with the shell
+
+```bash
+metricsctl rules list                      # aligned table for humans
+metricsctl rules list -o json | jq '.[] | select(.enabled==false) | .id'
+metricsctl rules get cpu-high -o yaml > cpu-high.yaml
+metricsctl rules list -o name | xargs -n1 metricsctl rules get -o yaml
+```
+
+**Expected:** `-o json`/`-o yaml` encode the raw API object — never the table
+projection — and a list stays a list even with one element. `-o name` prints one
+identifier per line. Colour never reaches a pipe or a file.
+
+### 8.5 Declarative rules (`apply`)
+
+`rules.yaml` (see [examples/alerting/rules.yaml](examples/alerting/rules.yaml)):
+
+```yaml
+apiVersion: v1
+kind: Rule
+metadata:
+  name: cpu-high            # the rule's stable id — this is what makes apply idempotent
+spec:
+  expression: cpu_usage_percent > 90
+  for: 1m
+  interval: 15s
+  severity: warning
+  receivers: [log]
+  annotations:
+    summary: "CPU is {{ .Value }}% on {{ .Labels.agent_id }}"
+---
+apiVersion: v1
+kind: Rule
+metadata:
+  name: memory-critical
+spec:
+  expression: avg_over_time(memory_used_percent[5m]) > 95 for 2m
+  severity: critical
+```
+
+```bash
+metricsctl rules apply -f rules.yaml --dry-run   # validate, write nothing
+metricsctl rules apply -f rules.yaml
+metricsctl rules apply -f rules.yaml             # again: everything "unchanged"
+cat rules.yaml | metricsctl rules apply -f -     # from stdin, for a pipeline
+```
+
+**Expected:** a diff-style report — `created` / `updated` / `unchanged` — so it
+is obvious what actually happened. Re-applying an unchanged file writes nothing,
+which is what makes `apply` safe to run from CI on every push.
+
+The manifest is the **desired state in full**: delete a field and the next apply
+reconciles it back to the server's default (`interval` 15s, `severity` warning,
+`enabled` true). Expressions are compiled locally before any request, so
+`--dry-run` rejects a bad rule even when it would only have been an update.
+
+### 8.6 Backtest before you commit
+
+```bash
+metricsctl rules preview 'cpu_usage_percent > 80' --from -1h --step 1m
+```
+
+### 8.7 Watch what is on fire
+
+```bash
+metricsctl alerts list
+metricsctl alerts list --state firing -o json
+metricsctl alerts list --watch --interval 2s     # redraws until Ctrl+C
+```
+
+**Expected:** firing alerts sort above pending ones. `--watch` needs the table
+format and a terminal; Ctrl+C exits `0`, not as an error.
+
+### 8.8 Silences and agents
+
+```bash
+metricsctl silences create -m agent_id=web-1 --duration 2h --comment "maintenance"
+metricsctl silences create -m 'env=~prod.*' -m severity=warning --duration 30m
+metricsctl silences list
+metricsctl silences delete <id> --yes
+
+metricsctl agents list
+metricsctl agents list -o name | xargs -n1 -I{} metricsctl query cpu_usage_percent -l agent_id={}
+```
+
+The server keeps no agent registry, so `agents list` derives one from a heartbeat
+metric (`uptime_seconds` by default; change it with `--heartbeat`). An agent
+silent for more than two minutes shows as `stale`.
+
+### 8.9 Exit codes are the contract
+
+```bash
+metricsctl rules get nope || echo "exit $?"     # 4 — not found
+metricsctl --token bad alerts list              # 3 — auth
+metricsctl rules list -o xml                    # 2 — usage
+metricsctl rules deletee cpu-high               # 2 — a typo is a usage error, not a silent 0
+metricsctl stats                                # 1 — server unreachable
+```
+
+`0` success, `1` generic failure, `2` usage error, `3` authentication or
+authorization, `4` not found. That is what makes
+`metricsctl rules get foo || handle_missing` reliable in a script.
+
+### 8.10 Scripts, prompts and colour
+
+```bash
+metricsctl rules delete cpu-high            # prompts on a terminal
+metricsctl rules delete cpu-high --yes      # required in a script
+NO_COLOR=1 metricsctl alerts list           # or --no-color
+```
+
+**Expected:** a destructive command run without a terminal and without `--yes`
+exits `2` with an explanation rather than hanging on a prompt nobody can answer
+or silently destroying things. Colour requires a real terminal — `/dev/null` is
+a character device but not a terminal, and gets no escape codes.
+
+### 8.11 Shell completion
+
+```bash
+source <(metricsctl completion bash)
+metricsctl completion zsh > "${fpath[1]}/_metricsctl"
+metricsctl completion fish > ~/.config/fish/completions/metricsctl.fish
+```
+
+Completion is **dynamic**: `metricsctl rules get <TAB>` asks the server which
+rules exist; `metricsctl --context <TAB>` lists the configured contexts.
+
+---
+
+## 9. Failure & edge flows
 
 | Flow | Trigger | Result |
 |------|---------|--------|
@@ -461,6 +638,11 @@ tenant-a's rule ID — `404` rather than `403`, so IDs cannot be probed.
 | Rule declaring a `tenant` label | `POST /api/v1/rules` | `400` (reserved, server-controlled) |
 | Receiver down | webhook/SMTP failing | retried with backoff + jitter, then the circuit opens |
 | Bad rules/receivers file | `-alert-rules`, `-alert-config` | startup error, non-zero exit |
+| Unknown CLI context | `metricsctl --context nope ...` | exit `4` |
+| Bad CLI output format | `metricsctl rules list -o xml` | exit `2` |
+| Destructive CLI command in a script | `metricsctl rules delete x` (no TTY, no `--yes`) | exit `2`, nothing deleted |
+| Bad rule manifest | `metricsctl rules apply -f bad.yaml` | exit `2`, nothing written |
+| Loose config permissions | `chmod 644 ~/.metricsctl/config.yaml` | warning on every invocation |
 
 ---
 

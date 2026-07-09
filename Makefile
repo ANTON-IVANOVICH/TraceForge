@@ -1,6 +1,11 @@
-.PHONY: tidy build test vet lint lint-install run-server run-agent proto proto-tools
+.PHONY: tidy build test vet lint lint-install run-server run-agent run-ctl proto proto-tools install-ctl
 
 GOBIN := $(shell go env GOPATH)/bin
+
+# Version reported by `metricsctl version`, taken from the SemVer tag when there
+# is one. -s -w drops the symbol table and DWARF info, shrinking the binary.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w -X main.version=$(VERSION)
 
 tidy:
 	go mod tidy
@@ -22,6 +27,11 @@ build:
 	mkdir -p bin
 	go build -o bin/server ./cmd/server
 	go build -o bin/agent ./cmd/agent
+	go build -ldflags '$(LDFLAGS)' -o bin/metricsctl ./cmd/metricsctl
+
+# Install metricsctl onto $GOPATH/bin, so it lands on PATH.
+install-ctl:
+	go install -ldflags '$(LDFLAGS)' ./cmd/metricsctl
 
 test:
 	go test -race -cover ./...
@@ -44,3 +54,6 @@ run-server:
 
 run-agent:
 	go run ./cmd/agent -server=http://localhost:8080/api/v1/metrics
+
+run-ctl:
+	go run -ldflags '$(LDFLAGS)' ./cmd/metricsctl $(ARGS)

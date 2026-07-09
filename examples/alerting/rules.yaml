@@ -1,0 +1,45 @@
+# Declarative alerting rules for `metricsctl rules apply -f`.
+#
+#   metricsctl rules apply -f examples/alerting/rules.yaml --dry-run
+#   metricsctl rules apply -f examples/alerting/rules.yaml
+#
+# metadata.name is the rule's stable id, which is what makes apply idempotent:
+# re-applying an unchanged file writes nothing.
+apiVersion: v1
+kind: Rule
+metadata:
+  name: cpu-high
+spec:
+  expression: cpu_usage_percent > 90
+  for: 1m
+  interval: 15s
+  severity: warning
+  receivers: [log]
+  annotations:
+    summary: "CPU is {{ .Value }}% on {{ .Labels.agent_id }}"
+    runbook: https://example.internal/runbooks/cpu-high
+---
+apiVersion: v1
+kind: Rule
+metadata:
+  name: memory-critical
+spec:
+  expression: avg_over_time(memory_used_percent[5m]) > 95 for 2m
+  interval: 30s
+  severity: critical
+  receivers: [log]
+  annotations:
+    summary: "Memory has averaged {{ .Value }}% over 5m on {{ .Labels.agent_id }}"
+---
+apiVersion: v1
+kind: Rule
+metadata:
+  name: disk-filling-up
+spec:
+  expression: max by (agent_id) (disk_used_percent) > 85
+  for: 5m
+  interval: 1m
+  severity: warning
+  receivers: [log]
+  labels:
+    team: platform

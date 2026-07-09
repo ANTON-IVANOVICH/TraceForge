@@ -1,0 +1,3 @@
+ID         NAME      SEVERITY   FOR    INTERVAL   ENABLED   EXPRESSION
+cpu-high   CPUHigh   critical   1m0s   15s        true      cpu_usage_percent > 90
+mem-high   MemHigh   warning    2m0s   30s        false     memory_used_percent > 95

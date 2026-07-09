@@ -4,9 +4,9 @@ How the system is put together: components, data flow, the concurrency model,
 storage internals, and the design decisions behind them. Kept in sync with the
 staged roadmap.
 
-- **Covers up to:** v0.7.0 (alerting)
+- **Covers up to:** v0.8.0 (metricsctl CLI)
 - **Last updated:** 2026-07-09
-- Go module: `metrics-system`. Two binaries: `agent` and `server`.
+- Go module: `metrics-system`. Three binaries: `agent`, `server`, `metricsctl`.
 
 ---
 
@@ -296,6 +296,61 @@ That ordering is what guarantees no data loss and no send-on-closed-channel race
 
 ---
 
+## 4b. CLI (`internal/cli`, `cmd/metricsctl`)
+
+`metricsctl` is a Cobra command tree over the server's HTTP API. Its shape is
+kubectl's — `noun verb`, persistent flags, named contexts, `-o json` — because a
+CLI is a UI, and a familiar one gets used instead of wrapped in shell scripts.
+
+```text
+cmd/metricsctl ─▶ cli.NewRootCmd ─▶ PersistentPreRunE: setup()
+                                        │ load config, resolve context,
+                                        │ apply flag overrides, build printer
+                                        ▼
+                                    cli.Context  ──(context.Context)──▶ every RunE
+                                     │  Client() (lazy)   Printer   Color
+                                     │  Stdout/Stderr/Stdin
+                                     ▼
+                        client.Client ──HTTP──▶ server API
+```
+
+- **Dependency injection through `context.Context`.** `setup` builds one
+  `cli.Context` and stashes it; each `RunE` pulls it back out. The API client is
+  built lazily, so `config get-contexts`, `completion` and `version` need no
+  reachable server.
+- **Streams are fields, not globals.** No command touches `os.Stdout`. That is
+  the entire reason the command tree is testable against a `bytes.Buffer` and an
+  `httptest.Server`, with golden files pinning the table layout.
+- **Contexts** (`cli/config`) are the kubeconfig model: a server, a credential,
+  optional TLS. Written `0600`; `${VAR}` expanded from the environment so a
+  checked-in config carries placeholders rather than secrets; `~` and
+  config-relative paths resolved, because YAML will not do it for you.
+- **Printers** (`cli/output`) separate the two audiences. `table` and `name` use
+  the human projection; `json` and `yaml` encode the **raw API object**, so
+  machine output never inherits a table's lossiness, and a list stays a list. The
+  table is aligned by hand rather than with `text/tabwriter`, which would count a
+  cell's ANSI colour bytes as visible width.
+- **Exit codes are an API**: `0/1/2/3/4` for ok/generic/usage/auth/not-found.
+  Cobra's own argument and flag validation is wrapped (`usageArgs`,
+  `SetFlagErrorFunc`) so those failures exit `2` rather than `1`; a noun command
+  such as `rules` is given a `Run` so a mistyped subcommand is a usage error
+  instead of a help screen and a silent success.
+- **Terminal manners.** Colour and prompts require a real terminal, detected with
+  the terminal ioctl (`golang.org/x/term`) — a file-mode check would call
+  `/dev/null` a terminal, since it is a character device. `NO_COLOR` and
+  `--no-color` win; a destructive command without a TTY needs `--yes`, so a
+  script neither hangs nor silently destroys.
+- **`rules apply` is declarative and idempotent.** `metadata.name` is the rule's
+  id. The CLI compiles the manifest with the *server's own* rule package, so it
+  knows the state the server would store — defaults filled in, a `for` clause
+  lifted out of the expression — then compares and writes only on a real
+  difference, reporting `created`/`updated`/`unchanged`. That is what lets an
+  omitted field mean "reset to the default" without making every apply rewrite
+  the rule, and what gives `--dry-run` teeth on the update path.
+- **Dependencies.** Cobra is the point of the stage. Viper, go-pretty and survey
+  are not: a hand-written aligner and loader and plain prompts do the same work
+  with less surface, in keeping with the rest of the project.
+
 ## 5. Configuration, logging, observability
 
 - **Config precedence:** defaults → environment variables → flags (both binaries).
@@ -310,12 +365,16 @@ That ordering is what guarantees no data loss and no send-on-closed-channel race
 
 ```text
 proto/metrics/v1/           protobuf service + messages
-cmd/{agent,server}/         entry points + flag/env config
+cmd/{agent,server,metricsctl}/  entry points + flag/env config
 internal/
   model/                    Metric, Batch, MetricType
   agent/                    collectors, HTTP + gRPC senders, orchestration
   auth/                     principal/RBAC, API keys, JWT (HS256/RS256), JWKS
   clock/                    injectable time: Real + deterministic Fake
+  cli/                      metricsctl: cobra tree, CLI context, errors/exit codes
+    config/                 kubectl-style contexts + credentials
+    client/                 HTTP client for the server API
+    output/                 table/json/yaml/name printers, TTY + NO_COLOR
   grpcconv/                 model <-> protobuf conversion
   proto/metricspb/          generated protobuf + gRPC code (go generate)
   alerting/                 service assembly + tenant-scoped alerting API
@@ -368,10 +427,9 @@ pkg/httpx/                  reusable HTTP client (retry + backoff)
 ## 8. What's next
 
 Single-node today. The roadmap (see the wiki `Roadmap` and `CHANGELOG.md`) adds a
-CLI on Cobra, a testing/benchmarking/profiling deep-dive, CGo integration, and a
-production deployment. Clustering (gossip membership, consistent-hash sharding,
-Raft) is a natural extension beyond the staged plan. This document is updated as
-each lands.
+testing/benchmarking/profiling deep-dive, CGo integration, and a production
+deployment. Clustering (gossip membership, consistent-hash sharding, Raft) is a
+natural extension beyond the staged plan. This document is updated as each lands.
 
 Known limitations of the alerting subsystem, deliberately deferred: the rule,
 state and silence stores are in-memory (a restart forgets pending retries and
