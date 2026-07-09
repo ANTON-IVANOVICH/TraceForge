@@ -22,10 +22,25 @@ type MetricDTO struct {
 	Labels    map[string]string `json:"labels,omitempty"`
 }
 
+// AlertEvent is the wire shape of an alert pushed to the dashboard. The live
+// package deliberately does not import the alerting packages — it is a
+// transport, so the caller adapts its domain type into this one.
+type AlertEvent struct {
+	Fingerprint string            `json:"fingerprint"`
+	Rule        string            `json:"rule"`
+	Status      string            `json:"status"` // "firing" | "resolved"
+	Severity    string            `json:"severity"`
+	Value       float64           `json:"value"`
+	StartsAt    time.Time         `json:"starts_at"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
 type envelope struct {
-	Type    string      `json:"type"` // "metrics" | "stats"
+	Type    string      `json:"type"` // "metrics" | "stats" | "alert"
 	Metrics []MetricDTO `json:"metrics,omitempty"`
 	Stats   any         `json:"stats,omitempty"`
+	Alert   *AlertEvent `json:"alert,omitempty"`
 }
 
 // client is one connected dashboard. tenant scopes which metrics it may see
@@ -45,6 +60,7 @@ type Hub struct {
 	unregisterCh chan *client
 	metricsCh    chan []model.Metric
 	statsCh      chan []byte
+	alertCh      chan AlertEvent
 	clients      map[*client]struct{}
 	done         chan struct{} // closed when Run exits
 	logger       *slog.Logger
@@ -60,6 +76,7 @@ func NewHub(logger *slog.Logger) *Hub {
 		unregisterCh: make(chan *client, 16),
 		metricsCh:    make(chan []model.Metric, 64),
 		statsCh:      make(chan []byte, 8),
+		alertCh:      make(chan AlertEvent, 64),
 		clients:      make(map[*client]struct{}),
 		done:         make(chan struct{}),
 		logger:       logger,
@@ -90,6 +107,15 @@ func (h *Hub) PublishMetrics(ms []model.Metric) {
 	select {
 	case h.metricsCh <- cp:
 	default: // hub busy; drop this batch from the live feed
+	}
+}
+
+// PublishAlert offers an alert to the hub. Like PublishMetrics it never blocks
+// the caller (here, the notifier's forwarding goroutine).
+func (h *Hub) PublishAlert(ev AlertEvent) {
+	select {
+	case h.alertCh <- ev:
+	default: // hub busy; the alert still reaches its receivers, just not the UI
 	}
 }
 
@@ -129,6 +155,8 @@ func (h *Hub) Run(ctx context.Context) {
 			}
 		case ms := <-h.metricsCh:
 			h.broadcastMetrics(ms)
+		case ev := <-h.alertCh:
+			h.broadcastAlert(ev)
 		case data := <-h.statsCh:
 			for c := range h.clients {
 				if c.admin {
@@ -147,6 +175,20 @@ func (h *Hub) broadcastMetrics(ms []model.Metric) {
 		}
 		data, err := json.Marshal(envelope{Type: "metrics", Metrics: dto})
 		if err != nil {
+			continue
+		}
+		deliver(c, data)
+	}
+}
+
+// broadcastAlert sends the alert only to clients allowed to see its tenant.
+func (h *Hub) broadcastAlert(ev AlertEvent) {
+	data, err := json.Marshal(envelope{Type: "alert", Alert: &ev})
+	if err != nil {
+		return
+	}
+	for c := range h.clients {
+		if c.tenant != "" && ev.Labels["tenant"] != c.tenant {
 			continue
 		}
 		deliver(c, data)

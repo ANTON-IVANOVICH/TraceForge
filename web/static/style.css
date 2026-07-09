@@ -69,5 +69,13 @@ th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spa
 td.num, th.num { text-align: right; }
 tbody tr:first-child { animation: flash .6s ease-out; }
 #feed { display: block; overflow-x: auto; max-height: 420px; overflow-y: auto; }
+#alerts { display: block; overflow-x: auto; max-height: 300px; overflow-y: auto; }
+#alerts tbody tr:first-child { animation: none; }
+.alert-resolved { opacity: .55; }
+.labels { color: var(--muted); white-space: normal; }
+
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; }
+.badge.firing   { background: rgba(248,81,73,.16);  color: #ff7b72; }
+.badge.resolved { background: rgba(63,185,80,.15);  color: var(--ok); }
 
 @keyframes flash { from { background: rgba(78,161,255,.18); } to { background: transparent; } }

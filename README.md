@@ -18,9 +18,9 @@ agent(s) ─────┤                            ├──► server
            ingest ─► validate ─► enrich ─► store   (channel pipeline, worker pools)
                                                   │
                                                   ▼
-                     storage: memory | bolt | tsdb
-                                                  ▲
-              HTTP  GET /api/v1/query ────────────┤
+                     storage: memory | bolt | tsdb ──► alerting ──► receivers
+                                                  ▲    (rules, for,   (log, webhook,
+              HTTP  GET /api/v1/query ────────────┤     grouping)      slack, email)
               gRPC  Query (server stream) ────────┘
 ```
 
@@ -46,10 +46,20 @@ agent(s) ─────┤                            ├──► server
 │   ├── agent/                 # collectors, HTTP sender, gRPC streaming sender
 │   ├── model/metric.go        # Metric, Batch, MetricType
 │   ├── auth/                  # API keys, JWT (HS256/RS256+JWKS), RBAC, tenant principal
+│   ├── clock/                 # injectable time (Real + Fake) for deterministic tests
 │   ├── grpcconv/              # model <-> protobuf conversion
 │   ├── proto/metricspb/       # generated protobuf + gRPC code (go generate)
+│   ├── alerting/
+│   │   ├── service.go         # assembly + tenant-scoped rules/alerts/silences API
+│   │   ├── rules/             # PromQL-lite DSL (lexer, parser, AST), evaluator, scheduler
+│   │   ├── alert/             # alert model, grouping, dedup
+│   │   ├── silence/           # silences + label matchers
+│   │   ├── inhibit/           # alert suppression rules
+│   │   ├── notify/            # dispatcher, retry queue, circuit breaker, receivers
+│   │   └── config/            # receivers/routing + bootstrap rules loading
 │   └── server/
 │       ├── handler.go         # thin HTTP handlers (ingest, query, stats, ui, pprof)
+│       ├── alerthandler.go    # rules / alerts / silences API
 │       ├── middleware.go      # recover, request id, logging, rate limiting
 │       ├── authmw.go          # auth + RBAC middleware
 │       ├── server.go          # http.Server + graceful lifecycle
@@ -58,6 +68,7 @@ agent(s) ─────┤                            ├──► server
 │       ├── storage/           # TSDB: series/index/query + memory, bolt, tsdb backends
 │       ├── live/              # from-scratch WebSocket + broadcast hub (live dashboard)
 │       └── ratelimit/         # per-agent token-bucket limiter
+├── examples/alerting/         # sample rules + receivers configuration
 ├── web/                       # embedded dashboard SPA (go:embed)
 └── pkg/
     └── httpx/client.go        # reusable HTTP client with retry + backoff
@@ -90,6 +101,13 @@ make run-agent
 - `GET  /debug/stats` — pipeline + storage self-metrics (JSON)
 - `GET  /healthz` — liveness check
 - `GET  /debug/pprof/` — runtime profiling (`net/http/pprof`)
+
+With `-alerting` (all tenant-scoped; reads need `query`, writes need `admin`):
+
+- `GET|POST /api/v1/rules`, `GET|PUT|DELETE /api/v1/rules/{id}` — manage rules
+- `POST /api/v1/rules/preview` — backtest an expression without saving it
+- `GET  /api/v1/alerts` — currently pending and firing alerts
+- `GET|POST /api/v1/silences`, `DELETE /api/v1/silences/{id}` — manage silences
 
 ### Query parameters (`GET /api/v1/query`)
 
@@ -201,6 +219,65 @@ ever read its own series.
 curl -H 'X-API-Key: K2' 'localhost:8080/api/v1/query?name=cpu_usage_percent'
 ```
 
+## Alerting
+
+Off by default; enable with `-alerting`. Rule evaluation and notification
+delivery are deliberately separated: evaluation is periodic and deterministic,
+delivery is slow and talks to services that fail. They meet over one channel.
+
+```text
+rules ──► evaluator ──► alerts ──► grouper ──► notifier ──► receivers
+ (DSL)   (for/state)   (channel)  (dedup)    (breaker +    (log, webhook,
+                                              retry queue)   slack, email)
+                       silences ──┘  inhibitions ──┘
+```
+
+**Rule DSL** — a PromQL-lite language with a hand-written lexer and
+recursive-descent parser (`internal/alerting/rules`):
+
+```text
+cpu_usage_percent > 90 for 5m
+avg_over_time(memory_used_percent[5m]) > 95
+max by (agent_id) (disk_used_percent) > 85
+rate(http_requests_total[1m]) > 1000 and up{env=~"prod.*"} == 1
+```
+
+Comparison **filters**: `cpu > 90` evaluates to the samples that breach it.
+Functions: `rate`, `increase`, `delta`, `{avg,min,max,sum,count,last,stddev}_over_time`,
+`abs`, `ceil`, `floor`, `round`, `clamp_min`, `clamp_max`; aggregations
+`sum|avg|min|max|count|stddev` with `by`/`without`; operators `and`, `or`,
+`unless`, arithmetic, and `=`,`!=`,`=~`,`!~` label matchers (regexes anchored).
+
+**`for` semantics** — the condition must hold *continuously*. An alert walks
+`inactive → pending → firing → resolved`; a resolution is always announced. Its
+identity is a stable fingerprint over the rule ID plus sorted labels, so a
+re-evaluation is a dedup, not a new page.
+
+**Delivery** — alerts are grouped by `group_by` labels (one notification for
+fifty failed hosts), muted by **silences**, suppressed by **inhibition rules**
+(`HostDown` on a host hides `CPUHigh` on it), then delivered per receiver with
+exponential backoff **plus jitter** and a **circuit breaker** per receiver.
+Webhooks are HMAC-signed (`X-TraceForge-Signature`, timestamped against replay).
+
+```bash
+./bin/server -alerting \
+  -alert-rules=./examples/alerting/rules.json \
+  -alert-config=./examples/alerting/receivers.json
+```
+
+Rules, alerts and silences are managed at runtime (hot reload, no restart):
+
+```bash
+curl localhost:8080/api/v1/alerts
+curl -XPOST localhost:8080/api/v1/rules -d '{"name":"CPUHigh","expression":"cpu_usage_percent > 90 for 2m","receivers":["log"]}'
+curl -XPOST localhost:8080/api/v1/rules/preview -d '{"expression":"cpu_usage_percent > 90","step":"1m"}'   # backtest
+curl -XPOST localhost:8080/api/v1/silences -d '{"matchers":[{"name":"agent_id","op":"=","value":"web-1"}],"duration":"2h"}'
+```
+
+With `-auth` on, everything is tenant-scoped: a rule evaluates only against its
+own tenant's series, and a tenant can never see another's rules, alerts or
+silences. Reads need the `query` action; creating or deleting needs `admin`.
+
 ## Storage backends
 
 Pick the store with `-storage`; persistent backends keep data in `-data-dir`.
@@ -244,6 +321,11 @@ Priority: defaults → environment variables → flags.
 - `-jwks-url` / `JWKS_URL` — JWKS endpoint for RS256 JWT auth
 - `-jwt-issuer` / `JWT_ISSUER`, `-jwt-audience` / `JWT_AUDIENCE` — required claims (optional)
 - `-ui` / `UI` — serve the embedded live dashboard at `/` (default `true`)
+- `-alerting` / `ALERTING` — enable rule evaluation and notifications (default `false`)
+- `-alert-rules` / `ALERT_RULES_FILE` — bootstrap rules JSON file
+- `-alert-config` / `ALERT_CONFIG_FILE` — receivers/routing/inhibition JSON file
+- `-alert-lookback` / `ALERT_LOOKBACK` — how far back an instant selector reaches (default `5m`)
+- `-alert-buffer` / `ALERT_BUFFER` — evaluator→notifier channel buffer (default `1024`)
 
 ### Agent
 
@@ -286,3 +368,9 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
   both transports; auth off by default.
 - **v0.6.0** — Embedded live dashboard: a `go:embed` SPA and a from-scratch
   WebSocket pushing tenant-scoped live metrics and (admin) stats.
+- **v0.7.0** — Alerting: a PromQL-lite rule DSL (hand-written lexer +
+  recursive-descent parser), the `for` alert state machine, grouping with
+  dedup, silences and inhibition, receivers (log/webhook/Slack/email) with
+  HMAC-signed webhooks, retry with exponential backoff + jitter and a circuit
+  breaker per receiver; a tenant-scoped rules/alerts/silences API and an alerts
+  panel on the dashboard. Off by default.

@@ -4,7 +4,7 @@ How the system is put together: components, data flow, the concurrency model,
 storage internals, and the design decisions behind them. Kept in sync with the
 staged roadmap.
 
-- **Covers up to:** v0.6.0 (embedded live dashboard)
+- **Covers up to:** v0.7.0 (alerting)
 - **Last updated:** 2026-07-09
 - Go module: `metrics-system`. Two binaries: `agent` and `server`.
 
@@ -201,13 +201,98 @@ stats ticker ─────────────────▶ Hub.PublishS
   the `/ws` handler authenticates from query params (browsers can't set WS
   handshake headers), scopes the client to its tenant, and gates the stats stream
   to admins — so the live feed honors the same isolation as the query API.
+- The hub also carries **alerts** (§4.7): the notifier taps every alert it
+  receives, and the hub delivers it only to clients allowed to see its tenant.
+  The tap sits *before* silencing, because the dashboard should show what is
+  actually wrong, not only what got delivered. `live` never imports the alerting
+  packages — it is a transport, so `cmd/server` adapts the domain type into the
+  hub's `AlertEvent`.
 
-### 4.7 Lifecycle
+### 4.7 Alerting (`internal/alerting`)
 
-`signal.NotifyContext` (SIGINT/SIGTERM) → cancel → **both servers stop** (HTTP
-`Shutdown`, gRPC `GracefulStop`) → **`pipeline.Shutdown()`** drains all in-flight
-metrics → **`storage.Close()`** (flush WAL, release lock). Doing storage-close
-only after the drain guarantees no data loss and no send-on-closed-channel race.
+Off by default (`-alerting`). Here the system stops being passive and starts
+deciding.
+
+```text
+        ┌──────────── evaluation: periodic, deterministic ─────────────┐
+RuleStore ─▶ Manager ─▶ Evaluator ─▶ [for state machine] ─▶ alerts chan
+           (1 goroutine/rule,  (Querier = tenant-scoped
+            jitter + timeout)   read of storage)
+        └──────────────────────────────────────────────────────────────┘
+                     │   the only coupling: one buffered channel
+        ┌──────────── delivery: slow, unreliable, async ───────────────┐
+alerts chan ─▶ Notifier ─▶ Silencer ─▶ Inhibitor ─▶ Grouper ─▶ groups chan
+                                                                   │
+        workers ─▶ CircuitBreaker(per receiver) ─▶ Receiver ◀───────┤
+                          │ transient failure                       │
+                          ▼                                         │
+                   RetryQueue (backoff + jitter) ───────────────────┘
+        └──────────────────────────────────────────────────────────────┘
+```
+
+**Why the split.** Evaluation must not miss a tick and is storage-bound.
+Delivery talks to SMTP, Slack and webhooks, which time out and rate-limit.
+Wiring them directly would let one slow receiver stall rule evaluation.
+
+- **Rule DSL** (`rules/{lexer,parser,expression}.go`) — a hand-written lexer and
+  a **recursive-descent parser**: one method per grammar production, so the call
+  graph *is* the grammar and precedence is legible instead of table-driven.
+  Comparison has **filter semantics** (`cpu > 90` evaluates to the samples that
+  breach it) — that is what turns a vector into an alert set. Range selectors
+  (`cpu[5m]`) are legal only inside range functions, checked at *parse* time so a
+  malformed rule is rejected when created rather than at 3am. Input length, regex
+  length and recursion depth are bounded.
+- **State machine** (`rules/evaluator.go`) — `inactive → pending → firing →
+  resolved`. `for` requires a **continuous** breach: a lapse resets `ActiveAt`.
+  Resolutions are always emitted (alerting without resolve is just spam). Alert
+  identity is `Fingerprint(ruleID, sorted labels)`, stable across evaluations and
+  restarts — an unstable fingerprint would turn every evaluation into a new page.
+  A still-firing alert is re-emitted only every `ResendDelay`; resolved state is
+  kept for a grace period (so a flap is recognised as a resurrection, not a new
+  alert) and then dropped, so the store stays bounded.
+- **Scheduler** (`rules/manager.go`) — one goroutine per rule ticking on its own
+  interval, with a **random start delay** (otherwise every rule loaded at boot
+  evaluates on the same instant forever, turning steady read load into a periodic
+  burst) and a per-iteration timeout. `Apply` hot-reloads a rule by stopping and
+  awaiting its old runner under the lock, so a rule never has two runners.
+- **Grouping** (`alert/grouper.go`) — alerts are batched by `group_by` labels,
+  per receiver. `group_wait` lets an incident coalesce (fifty hosts fail over
+  ~30s, not simultaneously); `group_interval` bounds updates; `repeat_interval`
+  re-sends an unchanged group as a reminder. A content hash over sorted
+  (fingerprint, status) pairs decides whether anything actually changed.
+- **Silences** (`silence/`) and **inhibition** (`inhibit/`) filter alerts before
+  grouping. Both are tenant-safe: a silence or a source alert of tenant A cannot
+  affect tenant B. A silence with no matchers is rejected — it would mute
+  everything.
+- **Delivery** (`notify/`) — a worker pool over groups; one **circuit breaker per
+  receiver** (lock-free hot path via `sync/atomic`, mutex only for the rare
+  transitions, exactly one probe admitted while half-open) so a dead SMTP server
+  cannot accumulate a thousand goroutines stuck on a dial timeout; a **retry
+  queue** (`container/heap` keyed by next-attempt time) with exponential backoff
+  **and jitter** — without jitter a thousand tenants retry a shared webhook on the
+  same 1s/2s/4s boundaries and recreate the overload they are backing off from.
+  Permanent failures (4xx other than 408/429) are dropped, never retried.
+- **Receivers** — `log`, `webhook` (HMAC over `"<timestamp>.<body>"`, so a
+  captured request cannot be replayed), `slack`, and `email` (`net/smtp` takes no
+  context, so the call runs on its own goroutine and `Send` returns when the
+  context expires; headers are sanitised against injection).
+- **Tenancy** — `rules.StorageQuerier` force-injects `tenant=<owner>` into every
+  storage query, so a rule is *structurally* unable to observe another tenant's
+  series no matter what its expression asks for. A rule's `TenantID` and a
+  silence's owner come from the authenticated principal, never the request body;
+  a foreign ID reads as `404`, not `403`, so IDs cannot be probed.
+- **Testability** — `internal/clock` injects time (`Real`, and a `Fake` with
+  `Advance`/`BlockUntil`). Alerting is defined almost entirely in terms of
+  durations; testing it against the wall clock would be slow and flaky.
+
+### 4.8 Lifecycle
+
+`signal.NotifyContext` (SIGINT/SIGTERM) → cancel → **HTTP, gRPC and alerting stop**
+(HTTP `Shutdown`, gRPC `GracefulStop`; rule runners are cancelled, then the
+notifier drains) → **`pipeline.Shutdown()`** drains all in-flight metrics →
+**`storage.Close()`** (flush WAL, release lock). Alerting reads storage, so it
+stops before the store closes; the pipeline drains only once every writer is gone.
+That ordering is what guarantees no data loss and no send-on-closed-channel race.
 
 ---
 
@@ -230,14 +315,24 @@ internal/
   model/                    Metric, Batch, MetricType
   agent/                    collectors, HTTP + gRPC senders, orchestration
   auth/                     principal/RBAC, API keys, JWT (HS256/RS256), JWKS
+  clock/                    injectable time: Real + deterministic Fake
   grpcconv/                 model <-> protobuf conversion
   proto/metricspb/          generated protobuf + gRPC code (go generate)
+  alerting/                 service assembly + tenant-scoped alerting API
+    rules/                  DSL (lexer, parser, AST), evaluator, stores, scheduler
+    alert/                  alert model, grouping, dedup
+    silence/                silences + label matchers
+    inhibit/                alert suppression rules
+    notify/                 dispatcher, retry queue, circuit breaker
+      receivers/            log, webhook (HMAC), slack, email
+    config/                 receivers/routing + bootstrap rules loading
   server/                   HTTP handlers, middleware, auth mw, lifecycle
     grpcserver/             gRPC service, interceptors, lifecycle
     pipeline/               channel pipeline: stages, worker pools, stats
     storage/                Storage interface, query engine, memory|bolt|tsdb
     live/                   from-scratch WebSocket + broadcast hub
     ratelimit/              per-agent token-bucket limiter
+examples/alerting/          sample rules + receivers configuration
 web/                        embedded dashboard SPA (go:embed)
 pkg/httpx/                  reusable HTTP client (retry + backoff)
 ```
@@ -252,9 +347,16 @@ pkg/httpx/                  reusable HTTP client (retry + backoff)
   and a lossless cascading drain; worker pools tune each stage independently.
 - **`Storage` behind an interface.** Backends are swappable at runtime; the query
   engine is shared so aggregation is identical everywhere.
-- **From-scratch TSDB and JWT.** Built on the stdlib (no third-party TSDB/JWT
-  libs) — the point is to expose the mechanics (WAL/mmap/fsync;
-  base64url/HMAC/RSA/claims) rather than hide them.
+- **From-scratch TSDB, JWT, WebSocket and rule parser.** Built on the stdlib (no
+  third-party TSDB/JWT/WebSocket/parser-generator libraries) — the point is to
+  expose the mechanics (WAL/mmap/fsync; base64url/HMAC/RSA/claims; RFC 6455
+  framing; recursive descent) rather than hide them.
+- **Evaluation and delivery never share a goroutine.** Alerting's two halves have
+  opposite properties — one deterministic and periodic, one slow and failure-prone
+  — so they are joined only by a buffered channel, with a circuit breaker and a
+  retry queue absorbing the failures on the far side.
+- **Time is injected.** `internal/clock` exists because alerting is defined in
+  durations (`for 5m`, `group_wait`, backoff); a test that sleeps is slow and flaky.
 - **Tenant as a server-controlled label.** Isolation reuses the existing label +
   query machinery instead of a separate per-tenant store; the label is never
   client-settable.
@@ -265,6 +367,13 @@ pkg/httpx/                  reusable HTTP client (retry + backoff)
 
 ## 8. What's next
 
-Single-node today. The roadmap (see the wiki `Roadmap` and `CHANGELOG.md`) adds
-clustering (gossip, consistent-hash sharding, Raft), a web UI, alerting, a CLI,
-and deployment. This document is updated as each lands.
+Single-node today. The roadmap (see the wiki `Roadmap` and `CHANGELOG.md`) adds a
+CLI on Cobra, a testing/benchmarking/profiling deep-dive, CGo integration, and a
+production deployment. Clustering (gossip membership, consistent-hash sharding,
+Raft) is a natural extension beyond the staged plan. This document is updated as
+each lands.
+
+Known limitations of the alerting subsystem, deliberately deferred: the rule,
+state and silence stores are in-memory (a restart forgets pending retries and
+silences, and re-arms `for` windows), and there is no escalation, acknowledgement
+or recurring maintenance window.

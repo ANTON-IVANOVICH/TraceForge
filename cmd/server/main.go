@@ -15,7 +15,10 @@ import (
 	"syscall"
 	"time"
 
+	"metrics-system/internal/alerting"
+	"metrics-system/internal/alerting/alert"
 	"metrics-system/internal/auth"
+	"metrics-system/internal/clock"
 	"metrics-system/internal/server"
 	"metrics-system/internal/server/grpcserver"
 	"metrics-system/internal/server/live"
@@ -54,6 +57,23 @@ func main() {
 	limiter := ratelimit.New(cfg.rateLimitRPS, cfg.rateLimitBurst)
 	handler := server.NewHandler(pipe, store, logger)
 
+	// Optional alerting: evaluates rules against storage and notifies receivers.
+	// Built before the UI so its alerts can be tapped into the dashboard.
+	var alertSvc *alerting.Service
+	if cfg.alertingEnabled {
+		alertSvc, err = alerting.New(alerting.Config{
+			RulesFile:   cfg.alertRulesFile,
+			ConfigFile:  cfg.alertConfigFile,
+			Lookback:    cfg.alertLookback,
+			AlertBuffer: cfg.alertBuffer,
+		}, store, clock.New(), logger)
+		if err != nil {
+			logger.Error("alerting setup failed", "error", err)
+			os.Exit(1)
+		}
+		handler.SetAlerting(alertSvc)
+	}
+
 	// Optional embedded live dashboard: the hub taps the pipeline's store stage
 	// and pushes updates over WebSocket to connected browsers.
 	var hub *live.Hub
@@ -61,6 +81,9 @@ func main() {
 		hub = live.NewHub(logger)
 		pipe.SetObserver(hub.PublishMetrics) // must be before pipe.Start
 		handler.SetUI(hub, authn)
+		if alertSvc != nil {
+			alertSvc.SetObserver(func(a *alert.Alert) { hub.PublishAlert(toAlertEvent(a)) })
+		}
 	}
 	// Recover (outer) -> request id -> logging -> rate limit -> [auth] -> handler.
 	mws := []server.Middleware{
@@ -108,7 +131,7 @@ func main() {
 	// Run both transports concurrently. Each cancels the shared context on
 	// failure so the other drains too.
 	var wg sync.WaitGroup
-	errs := make(chan error, 2)
+	errs := make(chan error, 3)
 	run := func(name string, r interface{ Run(context.Context) error }) {
 		defer wg.Done()
 		if err := r.Run(ctx); err != nil {
@@ -125,6 +148,12 @@ func main() {
 		logger.Info("server started", "http_addr", cfg.addr, "grpc_addr", cfg.grpcAddr, "storage", cfg.storageType)
 	} else {
 		logger.Info("server started", "http_addr", cfg.addr, "storage", cfg.storageType)
+	}
+	// Alerting reads storage, so it stops with the servers — before the store is
+	// closed below.
+	if alertSvc != nil {
+		wg.Add(1)
+		go run("alerting", alertSvc)
 	}
 
 	wg.Wait()
@@ -149,6 +178,21 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("server stopped")
+}
+
+// toAlertEvent adapts an alerting domain alert into the dashboard's wire shape.
+// The live package stays independent of the alerting packages this way.
+func toAlertEvent(a *alert.Alert) live.AlertEvent {
+	return live.AlertEvent{
+		Fingerprint: a.Fingerprint,
+		Rule:        a.RuleName,
+		Status:      string(a.Status),
+		Severity:    a.Severity,
+		Value:       a.Value,
+		StartsAt:    a.StartsAt,
+		Labels:      a.Labels,
+		Annotations: a.Annotations,
+	}
 }
 
 // publishStatsLoop pushes a stats snapshot to the live dashboard every 2s.
@@ -263,6 +307,12 @@ type config struct {
 	jwtAudience string
 
 	uiEnabled bool
+
+	alertingEnabled bool
+	alertRulesFile  string
+	alertConfigFile string
+	alertLookback   time.Duration
+	alertBuffer     int
 }
 
 func loadConfig() config {
@@ -285,6 +335,12 @@ func loadConfig() config {
 		jwtIssuer:       envString("JWT_ISSUER", ""),
 		jwtAudience:     envString("JWT_AUDIENCE", ""),
 		uiEnabled:       envBool("UI", true),
+
+		alertingEnabled: envBool("ALERTING", false),
+		alertRulesFile:  envString("ALERT_RULES_FILE", ""),
+		alertConfigFile: envString("ALERT_CONFIG_FILE", ""),
+		alertLookback:   envDuration("ALERT_LOOKBACK", 5*time.Minute),
+		alertBuffer:     envInt("ALERT_BUFFER", 1024),
 	}
 
 	flag.StringVar(&cfg.addr, "addr", cfg.addr, "HTTP listen address")
@@ -305,6 +361,11 @@ func loadConfig() config {
 	flag.StringVar(&cfg.jwtIssuer, "jwt-issuer", cfg.jwtIssuer, "required JWT issuer (optional)")
 	flag.StringVar(&cfg.jwtAudience, "jwt-audience", cfg.jwtAudience, "required JWT audience (optional)")
 	flag.BoolVar(&cfg.uiEnabled, "ui", cfg.uiEnabled, "serve the embedded live dashboard at /")
+	flag.BoolVar(&cfg.alertingEnabled, "alerting", cfg.alertingEnabled, "enable rule evaluation and notifications")
+	flag.StringVar(&cfg.alertRulesFile, "alert-rules", cfg.alertRulesFile, "path to a bootstrap alerting rules JSON file")
+	flag.StringVar(&cfg.alertConfigFile, "alert-config", cfg.alertConfigFile, "path to the alerting receivers/routing JSON file")
+	flag.DurationVar(&cfg.alertLookback, "alert-lookback", cfg.alertLookback, "how far back a rule's instant selector may look")
+	flag.IntVar(&cfg.alertBuffer, "alert-buffer", cfg.alertBuffer, "evaluator-to-notifier channel buffer size")
 	flag.Parse()
 
 	return cfg
@@ -353,6 +414,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 func envFloat(key string, fallback float64) float64 {

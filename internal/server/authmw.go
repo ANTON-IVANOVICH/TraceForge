@@ -23,9 +23,28 @@ func actionForRequest(r *http.Request) (auth.Action, bool) {
 		return auth.ActionIngest, true
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/query":
 		return auth.ActionQuery, true
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/rules/preview":
+		// A backtest only reads the caller's own series.
+		return auth.ActionQuery, true
+	case r.Method == http.MethodGet && isAlertingPath(r.URL.Path):
+		return auth.ActionQuery, true
 	default:
-		// /debug/stats, /debug/pprof/* and anything else are privileged.
+		// Mutating rules and silences, /debug/stats, /debug/pprof/* and anything
+		// else are privileged.
 		return auth.ActionAdmin, true
+	}
+}
+
+// isAlertingPath reports whether the path belongs to the read side of the
+// alerting API.
+func isAlertingPath(path string) bool {
+	switch {
+	case path == "/api/v1/alerts",
+		path == "/api/v1/rules", strings.HasPrefix(path, "/api/v1/rules/"),
+		path == "/api/v1/silences", strings.HasPrefix(path, "/api/v1/silences/"):
+		return true
+	default:
+		return false
 	}
 }
 

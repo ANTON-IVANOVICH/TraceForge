@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-09
+
+Alerting: the system stops being purely passive (store and show) and becomes
+active — it watches its own data, decides when something is wrong, and tells
+someone. Rule evaluation and notification delivery are separated by a channel,
+because one is periodic and deterministic while the other talks to services that
+time out, rate-limit and fall over.
+
+### Added
+
+- `internal/alerting/rules`: a **PromQL-lite rule DSL** with a hand-written lexer
+  and a recursive-descent parser (one function per grammar production), an AST
+  and its evaluator. Comparisons *filter* (`cpu > 90` yields the breaching
+  samples); range functions (`rate`, `increase`, `delta`,
+  `{avg,min,max,sum,count,last,stddev}_over_time`) with counter-reset handling;
+  instant functions (`abs`, `ceil`, `floor`, `round`, `clamp_min`, `clamp_max`);
+  aggregations (`sum|avg|min|max|count|stddev`) with `by`/`without`; `and`, `or`,
+  `unless`; label matchers `=`, `!=`, `=~`, `!~` with fully anchored regexes.
+  Parse errors carry a byte position; input length, regex length and recursion
+  depth are bounded.
+- The **alert state machine** (`inactive → pending → firing → resolved`) with
+  `for` semantics: an alert fires only after the condition has held
+  *continuously*. Resolutions are always announced — including when the rule that
+  produced them is deleted or disabled, and never for an alert that was silenced
+  or inhibited and therefore never announced in the first place. Alert identity is
+  a stable fingerprint over the rule ID plus sorted labels, so re-evaluation
+  dedups instead of re-paging. Annotations are `text/template` expanded over the
+  alert's value and labels.
+- A **scheduler** (`rules.Manager`): one goroutine per rule ticking on its own
+  interval, with a randomised start delay (so rules loaded together do not
+  stampede storage), a per-iteration timeout, and hot reload without a restart.
+- `internal/alerting/alert`: **grouping and dedup** — one notification for fifty
+  failed hosts. `group_wait` / `group_interval` / `repeat_interval` scheduling,
+  with a content hash so an unchanged group is not re-sent.
+- `internal/alerting/silence`: **silences** (mute matching alerts for a window)
+  with `=`, `!=`, `=~`, `!~` matchers; `internal/alerting/inhibit`: **inhibition
+  rules** (a firing `HostDown` suppresses `CPUHigh` on the same host).
+- `internal/alerting/notify`: the dispatcher, a **retry queue** with exponential
+  backoff **and jitter** (a shared webhook must not be hit by a thundering herd
+  of synchronised retries), and a **circuit breaker** per receiver — lock-free on
+  the hot path, admitting exactly one probe while half-open.
+- `internal/alerting/notify/receivers`: `log`, `webhook` (HMAC-signed with a
+  signed timestamp against replay), `slack` (incoming webhook), and `email`
+  (`net/smtp`, header-injection safe). Permanent failures (4xx other than
+  408/429) are never retried.
+- `internal/clock`: an injectable `Clock` (`Real` + a deterministic `Fake` with
+  `Advance`/`BlockUntil`), so the time-heavy alerting logic is tested without
+  sleeps.
+- Tenant-scoped alerting API: `GET|POST /api/v1/rules`,
+  `GET|PUT|DELETE /api/v1/rules/{id}`, `POST /api/v1/rules/preview` (backtest an
+  expression over historical data without saving it), `GET /api/v1/alerts`,
+  `GET|POST /api/v1/silences`, `DELETE /api/v1/silences/{id}`.
+- Flags: `-alerting`, `-alert-rules`, `-alert-config`, `-alert-lookback`,
+  `-alert-buffer` (plus the matching env vars). Off by default.
+- `examples/alerting/{rules,receivers}.json` — a runnable sample configuration.
+
+### Changed
+
+- The live dashboard gained an **alerts panel**; the hub pushes tenant-scoped
+  `alert` events over the existing WebSocket.
+- RBAC extends to alerting: reading rules/alerts/silences needs the `query`
+  action, mutating them needs `admin`.
+- Multi-tenancy extends to alerting: a rule evaluates through a querier that
+  force-injects `tenant=<owner>` into every storage query, and a tenant can
+  neither see nor modify another tenant's rules, alerts or silences. A rule's
+  tenant comes from the authenticated principal, never from the request body.
+- `cmd/server`: the alerting service runs alongside the HTTP and gRPC servers
+  and stops with them, before the pipeline drains and storage is closed.
+
+### Security
+
+- Webhook payloads are signed `sha256=HMAC(secret, "<unix-ts>.<body>")`; signing
+  the timestamp is what stops a captured request from being replayed later.
+- `tenant` is a reserved rule label. It is rejected at rule creation and
+  re-stamped from the rule's owner during evaluation, so a rule can neither forge
+  the tenant attribution of its alerts nor lose it to an aggregation such as
+  `max by (agent_id) (…)`.
+- Silences are applied at delivery time as well as on ingest, so a silence
+  created after an alert was grouped still suppresses its repeat reminders.
+- Email headers are sanitised, so a newline smuggled through a label cannot
+  inject extra headers. The SMTP conversation runs on a connection with a dial
+  timeout and an absolute deadline, and is closed on context cancellation —
+  `smtp.SendMail` sets neither, so a peer that accepts and then goes silent would
+  otherwise strand one goroutine per alert.
+- A silence with no matchers is rejected: it would mute every alert in the system.
+
 ## [0.6.0] - 2026-07-09
 
 An embedded live dashboard: a single-page app served from the binary and a
@@ -221,7 +307,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.3.0...v0.4.0

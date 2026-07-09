@@ -1,0 +1,47 @@
+{
+  "group_by": ["alertname", "tenant"],
+  "group_wait": "30s",
+  "group_interval": "5m",
+  "repeat_interval": "4h",
+  "default_receivers": ["log"],
+
+  "receivers": [
+    {
+      "name": "log",
+      "type": "log"
+    },
+    {
+      "name": "ops-webhook",
+      "type": "webhook",
+      "url": "http://localhost:9099/alerts",
+      "secret": "change-me",
+      "headers": { "X-Environment": "staging" },
+      "timeout": "10s"
+    },
+    {
+      "name": "slack",
+      "type": "slack",
+      "webhook_url": "https://hooks.slack.com/services/T000/B000/XXXX",
+      "channel": "#alerts",
+      "username": "TraceForge"
+    },
+    {
+      "name": "oncall-email",
+      "type": "email",
+      "host": "smtp.example.com",
+      "port": 587,
+      "smtp_username": "traceforge",
+      "password": "change-me",
+      "from": "traceforge@example.com",
+      "to": ["oncall@example.com"]
+    }
+  ],
+
+  "inhibit_rules": [
+    {
+      "source_matchers": [{ "name": "alertname", "op": "=", "value": "HostDown" }],
+      "target_matchers": [{ "name": "severity", "op": "=~", "value": "warning|critical" }],
+      "equal": ["agent_id"]
+    }
+  ]
+}

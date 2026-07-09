@@ -4,7 +4,7 @@ A catalog of end-to-end flows the system supports, written as runnable recipes.
 This file is maintained alongside the staged roadmap: each milestone that adds a
 user-visible capability also adds or updates the relevant scenarios here.
 
-- **Covers up to:** v0.6.0 (embedded live dashboard)
+- **Covers up to:** v0.7.0 (alerting)
 - **Last updated:** 2026-07-09
 
 Conventions used below:
@@ -271,7 +271,179 @@ credential is rejected at the handshake (`401`).
 ./bin/server -ui=false     # no dashboard, no /ws; API + gRPC unchanged
 ```
 
-## 7. Failure & edge flows
+---
+
+## 7. Alerting
+
+> Off by default; enable with `-alerting`. Without `-alert-config` a single
+> `log` receiver is used, so the whole stack is demonstrable with no external
+> service.
+
+### 7.1 Fire an alert end to end
+
+**Goal:** watch a rule go from quiet to firing to resolved.
+
+```bash
+./bin/server -alerting \
+  -alert-rules=./examples/alerting/rules.json \
+  -alert-config=./examples/alerting/receivers.json
+./bin/agent
+```
+
+**Expected:** once `cpu_usage_percent` has stayed above 90 for the rule's `for`
+window, the server logs an `alert notification` and posts a signed webhook. When
+CPU drops — or the agent stops and the series goes stale past `-alert-lookback` —
+a second notification arrives with `"status":"resolved"`.
+
+### 7.2 The rule DSL
+
+```text
+cpu_usage_percent > 90 for 5m                       # comparison filters: the breaching samples
+avg_over_time(memory_used_percent[5m]) > 95         # range function over a window
+max by (agent_id) (disk_used_percent) > 85          # aggregate, then compare
+rate(http_requests_total[1m]) > 1000                # per-second rate, counter resets handled
+up{env=~"prod.*"} == 0 unless maintenance_mode == 1 # matchers + set operations
+```
+
+- `for` may live in the rule (`"for": "5m"`) or in the expression text.
+- Regexes are **fully anchored**: `env=~"prod"` does not match `production`.
+- Every alert gets `alertname` and `severity` labels unless the rule sets them.
+- Annotations are templates: `"summary": "CPU is {{ .Value }}% on {{ .Labels.agent_id }}"`.
+
+### 7.3 Manage rules at runtime (hot reload)
+
+```bash
+curl -s localhost:8080/api/v1/rules | jq
+curl -s -XPOST localhost:8080/api/v1/rules -H 'Content-Type: application/json' -d '{
+  "name":"MemoryCritical",
+  "expression":"avg_over_time(memory_used_percent[5m]) > 95",
+  "for":"2m", "interval":"30s", "severity":"critical", "receivers":["log"]
+}' | jq
+curl -s -XDELETE localhost:8080/api/v1/rules/<id> -i
+```
+
+**Expected:** `201 Created`, and the rule starts evaluating immediately — no
+restart. A bad expression is rejected at creation with `400` and a byte position,
+e.g. `parse error at position 20: expected an expression but found end of input`.
+
+Deleting (or disabling) a rule that is currently firing **announces the
+resolution** first, so receivers are told the incident is over instead of being
+reminded about it forever. `tenant` is a reserved rule label and is rejected.
+
+### 7.4 Backtest before you commit (`preview`)
+
+**Goal:** see what a rule *would* have fired on, before saving it.
+
+```bash
+curl -s -XPOST localhost:8080/api/v1/rules/preview -H 'Content-Type: application/json' -d '{
+  "expression":"cpu_usage_percent > 80",
+  "from":"2026-07-09T10:00:00Z","to":"2026-07-09T11:00:00Z","step":"1m"
+}' | jq
+```
+
+**Expected:** `{"results":[{"at":…,"samples":[…]}],"count":N}` — one entry per
+step at which the expression matched. The window is capped at 500 steps.
+
+### 7.5 Inspect active alerts
+
+```bash
+curl -s localhost:8080/api/v1/alerts | jq '.[] | {state, labels, value}'
+```
+
+States: `pending` (the condition holds but `for` has not elapsed) and `firing`.
+The dashboard shows the same set in its **Alerts** panel, updated live.
+
+### 7.6 Silence an alert during maintenance
+
+```bash
+curl -s -XPOST localhost:8080/api/v1/silences -H 'Content-Type: application/json' -d '{
+  "matchers":[{"name":"agent_id","op":"=","value":"web-1"}],
+  "duration":"2h","created_by":"anton","comment":"planned maintenance"
+}' | jq
+curl -s localhost:8080/api/v1/silences | jq
+curl -s -XDELETE localhost:8080/api/v1/silences/<id> -i
+```
+
+Matcher ops: `=`, `!=`, `=~`, `!~`. **Expected:** matching alerts stop producing
+notifications but still appear in `GET /api/v1/alerts` and on the dashboard —
+silencing hides the page, not the problem. A silence created *after* an alert was
+already grouped still suppresses its repeat reminders. A silence with **no
+matchers** is rejected (`400`): it would mute every alert in the system.
+
+### 7.7 Suppress follow-up alerts (inhibition)
+
+In the alerting config:
+
+```json
+{"inhibit_rules":[{
+  "source_matchers":[{"name":"alertname","op":"=","value":"HostDown"}],
+  "target_matchers":[{"name":"severity","op":"=~","value":"warning|critical"}],
+  "equal":["agent_id"]
+}]}
+```
+
+**Expected:** while `HostDown` fires for `agent_id=web-1`, other alerts on
+`web-1` are suppressed. A dead host's CPU being strange is not news.
+
+### 7.8 Receivers, grouping and delivery
+
+```json
+{
+  "group_by": ["alertname", "tenant"],
+  "group_wait": "30s", "group_interval": "5m", "repeat_interval": "4h",
+  "default_receivers": ["log"],
+  "receivers": [
+    {"name":"log","type":"log"},
+    {"name":"hook","type":"webhook","url":"https://ops.example/alerts","secret":"…"},
+    {"name":"slack","type":"slack","webhook_url":"https://hooks.slack.com/…"},
+    {"name":"oncall","type":"email","host":"smtp.example.com","port":587,
+     "smtp_username":"u","password":"p","from":"a@b.c","to":["oncall@b.c"]}
+  ]
+}
+```
+
+- `group_wait` — how long to let an incident coalesce before the first
+  notification, so fifty failing hosts become **one** message.
+- `group_interval` — how soon an *updated* group may notify again.
+- `repeat_interval` — how often an *unchanged* group is re-sent as a reminder.
+- Each receiver has its own **circuit breaker**, so a dead SMTP server cannot
+  stall Slack. Failures retry with exponential backoff **and jitter**; a `4xx`
+  other than `408`/`429` is permanent and dropped without retry.
+
+### 7.9 Verify a webhook signature
+
+Every webhook carries `X-TraceForge-Timestamp` and
+`X-TraceForge-Signature: sha256=<hex>`, where the HMAC covers
+`"<timestamp>.<body>"` — the timestamp is signed too, so a captured request
+cannot be replayed later.
+
+```python
+mac = hmac.new(secret.encode(), (ts + "." + body).encode(), hashlib.sha256)
+assert hmac.compare_digest("sha256=" + mac.hexdigest(), signature)
+```
+
+### 7.10 Alerting with auth on
+
+```bash
+./bin/server -auth -api-keys=./api-keys.json -alerting
+curl -H 'X-API-Key: KA-reader' localhost:8080/api/v1/alerts                # ✅ query action
+curl -H 'X-API-Key: KA-reader' -XPOST localhost:8080/api/v1/rules -d '…'   # 403 (admin only)
+curl -H 'X-API-Key: KA-admin'  -XPOST localhost:8080/api/v1/rules -d '…'   # ✅ 201
+```
+
+**Expected:** a rule's tenant comes from the credential, never from the body. A
+rule evaluates only against its own tenant's series, and tenant-b gets `404` for
+tenant-a's rule ID — `404` rather than `403`, so IDs cannot be probed.
+
+### 7.11 Disable alerting
+
+```bash
+./bin/server            # no rule evaluation, no /api/v1/rules|alerts|silences routes
+```
+
+---
+
+## 8. Failure & edge flows
 
 | Flow | Trigger | Result |
 |------|---------|--------|
@@ -282,6 +454,13 @@ credential is rejected at the handshake (`401`).
 | Expired / bad-signature JWT | `Authorization: Bearer <bad>` | `401` |
 | Wrong storage type | `-storage=foo` | startup error, non-zero exit |
 | gRPC without credentials (auth on) | any RPC | `Unauthenticated` |
+| Bad rule expression | `POST /api/v1/rules` | `400 parse error at position N: …` |
+| `rate(cpu)` without a range | rule creation | `400 … requires a range vector selector like metric[5m]` |
+| Preview window too large | `from`/`to`/`step` > 500 steps | `400 preview window too large` |
+| Silence with no matchers | `POST /api/v1/silences` | `400` (it would mute everything) |
+| Rule declaring a `tenant` label | `POST /api/v1/rules` | `400` (reserved, server-controlled) |
+| Receiver down | webhook/SMTP failing | retried with backoff + jitter, then the circuit opens |
+| Bad rules/receivers file | `-alert-rules`, `-alert-config` | startup error, non-zero exit |
 
 ---
 

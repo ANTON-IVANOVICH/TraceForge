@@ -10,7 +10,8 @@ const MAX_POINTS = 120;
 const state = {
   ws: null,
   backoff: 500,
-  chart: [], // recent "stored" counter values
+  chart: [],           // recent "stored" counter values
+  alerts: new Map(),   // fingerprint -> latest alert event
 };
 
 function setStatus(on) {
@@ -42,6 +43,7 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === "metrics") addMetrics(msg.metrics || []);
     else if (msg.type === "stats") updateStats(msg.stats);
+    else if (msg.type === "alert") updateAlert(msg.alert);
   };
   ws.onclose = () => {
     setStatus(false);
@@ -72,6 +74,53 @@ function addMetrics(metrics) {
   }
   tbody.insertBefore(frag, tbody.firstChild);
   while (tbody.children.length > MAX_ROWS) tbody.removeChild(tbody.lastChild);
+}
+
+// Alerts are keyed by fingerprint, so a re-sent firing alert updates its row in
+// place instead of piling up. A resolved alert lingers briefly so the operator
+// sees that it cleared, then disappears.
+const RESOLVED_LINGER_MS = 30000;
+
+function updateAlert(a) {
+  if (!a || !a.fingerprint) return;
+  if (a.status === "resolved") {
+    a.removeAt = Date.now() + RESOLVED_LINGER_MS;
+  }
+  state.alerts.set(a.fingerprint, a);
+  renderAlerts();
+}
+
+function renderAlerts() {
+  const now = Date.now();
+  for (const [fp, a] of state.alerts) {
+    if (a.removeAt && a.removeAt <= now) state.alerts.delete(fp);
+  }
+
+  const rows = [...state.alerts.values()].sort((x, y) =>
+    (x.status === y.status) ? x.rule.localeCompare(y.rule) : (x.status === "firing" ? -1 : 1));
+
+  const tbody = $("alerts").querySelector("tbody");
+  tbody.textContent = "";
+  for (const a of rows) {
+    const tr = document.createElement("tr");
+    tr.className = "alert-" + a.status;
+    const labels = Object.entries(a.labels || {})
+      .filter(([k]) => k !== "alertname" && k !== "severity")
+      .map(([k, v]) => `${k}=${v}`).join(", ");
+    tr.innerHTML =
+      `<td><span class="badge ${escapeHTML(a.status)}">${escapeHTML(a.status)}</span></td>` +
+      `<td>${escapeHTML(a.severity || "")}</td>` +
+      `<td>${escapeHTML(a.rule || "")}</td>` +
+      `<td class="num">${fmt(a.value)}</td>` +
+      `<td class="labels">${escapeHTML(labels)}</td>` +
+      `<td>${new Date(a.starts_at).toLocaleTimeString()}</td>`;
+    tr.title = Object.entries(a.annotations || {}).map(([k, v]) => `${k}: ${v}`).join("\n");
+    tbody.appendChild(tr);
+  }
+
+  const firing = rows.filter((a) => a.status === "firing").length;
+  $("alert-count").textContent = firing ? `${firing} firing` : "";
+  $("alerts-hint").style.display = rows.length ? "none" : "";
 }
 
 function updateStats(stats) {
@@ -130,5 +179,7 @@ window.addEventListener("load", () => {
   $("cred").value = localStorage.getItem("cred") || "";
   $("connect").addEventListener("click", connect);
   $("cred").addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+  // Sweep resolved alerts even when no new event arrives to trigger a render.
+  setInterval(renderAlerts, 5000);
   connect();
 });

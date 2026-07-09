@@ -1,0 +1,43 @@
+{
+  "rules": [
+    {
+      "id": "cpu-high",
+      "name": "CPUHigh",
+      "expression": "cpu_usage_percent > 90",
+      "for": "1m",
+      "interval": "15s",
+      "severity": "warning",
+      "receivers": ["log"],
+      "enabled": true,
+      "annotations": {
+        "summary": "CPU is at {{ .Value }}% on {{ .Labels.agent_id }}",
+        "runbook": "https://example.internal/runbooks/cpu-high"
+      }
+    },
+    {
+      "id": "memory-critical",
+      "name": "MemoryCritical",
+      "expression": "avg_over_time(memory_used_percent[5m]) > 95 for 2m",
+      "interval": "30s",
+      "severity": "critical",
+      "receivers": ["log"],
+      "enabled": true,
+      "annotations": {
+        "summary": "Memory has averaged {{ .Value }}% over 5m on {{ .Labels.agent_id }}"
+      }
+    },
+    {
+      "id": "disk-filling-up",
+      "name": "DiskFillingUp",
+      "expression": "max by (agent_id) (disk_used_percent) > 85",
+      "for": "5m",
+      "interval": "1m",
+      "severity": "warning",
+      "receivers": ["log"],
+      "enabled": true,
+      "annotations": {
+        "summary": "Disk at {{ .Value }}% on {{ .Labels.agent_id }}"
+      }
+    }
+  ]
+}

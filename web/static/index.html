@@ -30,6 +30,15 @@
     </section>
 
     <section class="panel">
+      <h2>Alerts <span id="alert-count" class="hint"></span></h2>
+      <table id="alerts">
+        <thead><tr><th>state</th><th>severity</th><th>rule</th><th class="num">value</th><th>labels</th><th>since</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p id="alerts-hint" class="hint">no alerts yet — start the server with <code>-alerting</code> and a rule file</p>
+    </section>
+
+    <section class="panel">
       <h2>Stored points over time</h2>
       <canvas id="chart" height="120"></canvas>
       <p id="chart-hint" class="hint">stats stream is admin-only; connect with an admin credential to see counters &amp; chart</p>

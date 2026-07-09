@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"metrics-system/internal/alerting"
 	"metrics-system/internal/auth"
 	"metrics-system/internal/model"
 	"metrics-system/internal/server/live"
@@ -32,6 +33,10 @@ type Handler struct {
 	// WebSocket are served.
 	hub   *live.Hub
 	authn auth.Authenticator
+
+	// Alerting (optional): set via SetAlerting. When non-nil the rules, alerts
+	// and silences API is served.
+	alerting *alerting.Service
 }
 
 // NewHandler wires the handler to its pipeline and storage.
@@ -49,6 +54,9 @@ func (h *Handler) SetUI(hub *live.Hub, authn auth.Authenticator) {
 	h.authn = authn
 }
 
+// SetAlerting enables the alerting API. Call before Routes.
+func (h *Handler) SetAlerting(svc *alerting.Service) { h.alerting = svc }
+
 // Routes builds the mux with the API, health, self-stats and pprof endpoints.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
@@ -56,6 +64,11 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/query", h.query)
 	mux.HandleFunc("GET /debug/stats", h.stats)
 	mux.HandleFunc("GET /healthz", h.health)
+
+	// Rules, alerts and silences (only when alerting is enabled via SetAlerting).
+	if h.alerting != nil {
+		h.alertRoutes(mux)
+	}
 
 	// Runtime profiling (net/http/pprof).
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
