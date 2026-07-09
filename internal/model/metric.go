@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -105,6 +106,13 @@ func (m Metric) Validate() error {
 	}
 	if m.Type != MetricTypeGauge && m.Type != MetricTypeCounter {
 		return fmt.Errorf("unsupported metric type: %d", m.Type)
+	}
+	// encoding/json cannot represent NaN/Inf, so the HTTP path rejects them at
+	// decode time; protobuf float64 carries them fine, so without this check a
+	// gRPC client could smuggle a non-finite value past the identical Validate
+	// gate the HTTP path relies on. Reject here to keep both transports uniform.
+	if math.IsNaN(m.Value) || math.IsInf(m.Value, 0) {
+		return fmt.Errorf("metric value must be finite, got %v", m.Value)
 	}
 	if m.Timestamp.IsZero() {
 		return errors.New("timestamp is required")

@@ -4,7 +4,7 @@ How the system is put together: components, data flow, the concurrency model,
 storage internals, and the design decisions behind them. Kept in sync with the
 staged roadmap.
 
-- **Covers up to:** v0.8.0 (metricsctl CLI)
+- **Covers up to:** v0.9.0 (testing, benchmarking & profiling)
 - **Last updated:** 2026-07-09
 - Go module: `metrics-system`. Three binaries: `agent`, `server`, `metricsctl`.
 
@@ -356,8 +356,13 @@ cmd/metricsctl ─▶ cli.NewRootCmd ─▶ PersistentPreRunE: setup()
 - **Config precedence:** defaults → environment variables → flags (both binaries).
 - **Logging:** structured `log/slog` JSON; every HTTP request carries an
   `X-Request-ID` propagated through context.
-- **Observability:** `GET /debug/stats` (pipeline + storage counters),
-  `GET /healthz` (public), `net/http/pprof` under `/debug/pprof/`.
+- **Observability:** `GET /debug/stats` (pipeline + storage counters — including
+  `failed`, metrics accepted but lost to a storage error), `GET /healthz`
+  (public), and `net/http/pprof` on a **separate listener** (`-pprof-addr`, off
+  by default). pprof is deliberately not on the API port: `/debug/pprof/cmdline`
+  exposes the process's argv and `/heap` exposes stored data. A non-loopback bind
+  is warned about. Mutex and block profiling are opt-in
+  (`-mutex-profile-fraction`, `-block-profile-rate`).
 
 ---
 
@@ -366,11 +371,15 @@ cmd/metricsctl ─▶ cli.NewRootCmd ─▶ PersistentPreRunE: setup()
 ```text
 proto/metrics/v1/           protobuf service + messages
 cmd/{agent,server,metricsctl}/  entry points + flag/env config
+cmd/{benchcmp,mutate}/      dev tools: significance-tested benchstat, mutation tester
 internal/
   model/                    Metric, Batch, MetricType
   agent/                    collectors, HTTP + gRPC senders, orchestration
   auth/                     principal/RBAC, API keys, JWT (HS256/RS256), JWKS
+  benchcmp/                 go test -bench parser + Mann-Whitney U test
+  mutate/                   AST mutators + go test -overlay runner
   clock/                    injectable time: Real + deterministic Fake
+  testutil/                 builders, assertions, Eventually, goroutine-leak detector
   cli/                      metricsctl: cobra tree, CLI context, errors/exit codes
     config/                 kubectl-style contexts + credentials
     client/                 HTTP client for the server API
@@ -394,7 +403,50 @@ internal/
 examples/alerting/          sample rules + receivers configuration
 web/                        embedded dashboard SPA (go:embed)
 pkg/httpx/                  reusable HTTP client (retry + backoff)
+test/e2e/                   //go:build e2e: real binaries as separate processes
 ```
+
+---
+
+## 4c. Testing architecture (`internal/testutil`, `test/e2e`, build tags)
+
+Tests are a pyramid, and the layers are kept apart by build tag so the fast base
+stays fast:
+
+```text
+              ┌─────────────┐
+              │    e2e      │  //go:build e2e — real server/agent/metricsctl
+              │  (seconds)  │  processes on :0 ports; addr read from the log
+              ├─────────────┤
+              │ integration │  //go:build integration — real bbolt/tsdb files,
+              │  (< 1s)     │  httptest, gRPC over bufconn, crash recovery
+              ├─────────────┤
+              │    unit     │  no tag, -race — pure logic, t.TempDir at most,
+              │  (ms each)  │  the wide base run on every push
+              └─────────────┘
+```
+
+- **`internal/testutil`** is the shared kit, imported only from `_test.go`:
+  object builders (so a new `Metric` field changes one line, not two hundred),
+  custom assertions, an `Eventually`/`Never` poller for the pipeline's async
+  boundary, golden-file support with `-update`, and a **goroutine-leak detector**
+  that diffs the set of live goroutine IDs across a test and reports any that
+  outlived it — the standard way a Go service dies slowly.
+- **Fuzzing** targets the code that parses untrusted bytes and asserts
+  *invariants*: `SeriesKey`↔`ParseSeriesKey` round-trip and injectivity, the rule
+  parser's `Parse`↔`String` idempotency, the chunk codec's point conservation,
+  WAL replay's prefix property, JWT forgery-resistance. Crashers are committed
+  under `testdata/fuzz/` and then run by every plain `go test`.
+- **`benchcmp` and `mutate`** are first-class parts of the architecture, not
+  scripts: benchmarks feed `benchcmp`'s significance test, and `mutate` grades the
+  test suite itself by editing one operator and rerunning the tests through a
+  `go test -overlay`.
+
+The e2e harness (`test/e2e/harness_test.go`) builds the three binaries once in
+`TestMain`, starts each with `-addr=127.0.0.1:0`, and recovers the
+kernel-assigned port from the server's structured startup log — which is why the
+lifecycle logs the addresses it actually bound. That is what lets every e2e test
+run its own server concurrently with no port registry.
 
 ---
 
@@ -421,6 +473,15 @@ pkg/httpx/                  reusable HTTP client (retry + backoff)
   client-settable.
 - **Auth off by default.** New security surface is opt-in, keeping the default
   build simple and backward compatible.
+- **The identity of a series must be injective.** `SeriesKey` and
+  `alert.Fingerprint` both encode a name plus a label set into one string, and
+  both must be reversible — a collision silently merges two series or two alerts.
+  Both escape (or length-prefix) their delimiters; the round-trip decoder is the
+  proof, and a fuzzer guards it.
+- **Tests are code, and graded like it.** Coverage says a line ran; the shipped
+  `mutate` tool says whether a test would notice if that line were wrong. Fuzzers
+  assert invariants, not just the absence of a panic. This is why several stage-9
+  fixes are for bugs that lived under a green suite.
 
 ---
 

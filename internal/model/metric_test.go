@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 )
@@ -46,6 +47,30 @@ func TestMetricTypeJSON(t *testing.T) {
 	}
 	if out.Type != MetricTypeCounter {
 		t.Fatalf("got %v, want %v", out.Type, MetricTypeCounter)
+	}
+}
+
+// TestMetricValidateRejectsNonFinite pins the boundary the gRPC path leans on:
+// a NaN/Inf value — unrepresentable in JSON, so impossible over HTTP — must be
+// rejected by Validate so it cannot be smuggled in over protobuf either.
+func TestMetricValidateRejectsNonFinite(t *testing.T) {
+	t.Parallel()
+	base := Metric{Name: "cpu", Type: MetricTypeGauge, Timestamp: time.Now().UTC()}
+	for name, v := range map[string]float64{
+		"NaN":  math.NaN(),
+		"+Inf": math.Inf(1),
+		"-Inf": math.Inf(-1),
+	} {
+		m := base
+		m.Value = v
+		if err := m.Validate(); err == nil {
+			t.Errorf("%s value accepted, want rejection", name)
+		}
+	}
+	// A finite value on the same metric still validates.
+	base.Value = 3.14
+	if err := base.Validate(); err != nil {
+		t.Errorf("finite value rejected: %v", err)
 	}
 }
 

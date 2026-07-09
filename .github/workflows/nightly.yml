@@ -1,0 +1,81 @@
+name: Nightly
+
+# The expensive checks. Neither belongs on a pull request: a ten-minute fuzz per
+# target and one `go test` per mutant would turn a two-minute review cycle into
+# an hour, and developers would learn to ignore the result.
+#
+# The scheduled trigger is commented out on purpose: an unattended fork should
+# not burn Actions minutes on a nightly cron nobody is watching. Run it by hand
+# from the Actions tab (workflow_dispatch), or re-enable the cron below once this
+# lives somewhere with someone reading the results.
+on:
+  # schedule:
+  #   - cron: "0 3 * * *"   # 03:00 UTC daily — re-enable to run unattended
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  fuzz-long:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: fuzz every target for ten minutes
+        run: make fuzz FUZZTIME=10m
+
+      # The crasher is the whole product of this job. Without it the failure says
+      # only "the fuzzer found something", and the input that found it is gone.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: "**/testdata/fuzz/**"
+          retention-days: 90
+
+  # Coverage says a line ran. Mutation testing says whether anything checked it.
+  # The packages listed here are the ones whose correctness the system rests on:
+  # a wrong series key corrupts data, a wrong comparison in the rule evaluator
+  # fires or suppresses an alert, a wrong token check lets a request through.
+  mutate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - ./internal/server/storage
+          - ./internal/alerting/rules
+          - ./internal/alerting/alert
+          - ./internal/auth
+          - ./internal/server/pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: build the mutation tester
+        run: go build -o /tmp/mutate ./cmd/mutate
+
+      # No -min-score gate. A surviving mutant is sometimes an equivalent mutant
+      # — `b.Grow(n)` with n+1 is a capacity hint, not behaviour — and failing the
+      # build on those teaches people to write tests that kill mutants rather than
+      # tests that check behaviour. The report is for a human to read.
+      - name: mutation test ${{ matrix.package }}
+        run: /tmp/mutate -workers 2 -timeout 90s ${{ matrix.package }} | tee /tmp/report.txt
+
+      - name: summary
+        if: always()
+        run: |
+          echo "## Mutation report — ${{ matrix.package }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/report.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

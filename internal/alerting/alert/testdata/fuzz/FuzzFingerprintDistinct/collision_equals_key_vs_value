@@ -1,0 +1,5 @@
+go test fuzz v1
+string("r")
+string("a=b\x1fc")
+string("r")
+string("a\x1fb=c")

@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-09
+
+Testing, benchmarking and profiling raised from "as we went" to an engineering
+discipline of its own. The point of the stage is not the count of new tests but
+what they *found*: writing an invariant-based fuzzer and a mutation tester turns
+up bugs that a green unit suite hides. Several of the fixes below are real
+correctness and security defects that existed in shipped code.
+
+### Added
+
+- `internal/testutil`: the shared test infrastructure — object builders, custom
+  assertions, an `Eventually`/`Never` poller for asynchronous conditions, a
+  golden-file helper with an `-update` flag and output normalisation, and a
+  **goroutine-leak detector** (`NoLeaks`) that snapshots goroutine IDs and
+  reports any that outlive the test. The detector has its own tests in both
+  directions, because a leak detector that silently stops detecting is the worst
+  kind.
+- **17 fuzz targets**, asserting invariants rather than just "does not panic":
+  round-trip and injectivity for the series key; round-trip and idempotency for
+  the rule parser and its `String()`; conservation for the chunk codec; the
+  prefix property for WAL replay; forgery-resistance for the JWT verifier;
+  round-trip for protobuf and JSON metric encoding; distinctness for the alert
+  fingerprint. Every discovered crasher is committed under `testdata/fuzz/` as a
+  regression seed.
+- **A benchmark suite** across the hot paths (series key, storage, pipeline, rule
+  evaluation, auth, WAL, chunk, table rendering), with sub-benchmarks over the
+  parameters that matter and `b.ReportAllocs` throughout — allocations feed the
+  GC, and the GC stops the world.
+- `cmd/benchcmp` + `internal/benchcmp`: a from-scratch **benchstat**. It parses
+  `go test -bench` output and reports whether a difference is statistically
+  significant with a **Mann-Whitney U test** — exact for small samples, a normal
+  approximation with a tie and continuity correction otherwise — so noise reads
+  as `~` instead of a phantom regression. Every p-value was pinned against SciPy
+  and an independent brute-force enumeration in review (agreement < 1e-9 across
+  equal/unequal n, ties, and the all-identical `0 allocs/op` case). It warns when
+  a file mixes GOMAXPROCS (`-8` vs `-4`) under one benchmark name.
+- `cmd/mutate` + `internal/mutate`: a from-scratch **mutation tester**. It splices
+  one operator at a time in the AST (`>`→`>=`, `&&`→`||`, `true`→`false`, a
+  literal `+1`) by byte offset — so formatting and `//go:build` lines survive —
+  and reruns the package's tests against each mutant using `go test -overlay`,
+  never copying the tree. Verdicts come from `go test -json`'s structured stream,
+  so a mutant whose own output mentions `[build failed]` is not misfiled; a
+  cancelled run kills the test binary via its process group rather than orphaning
+  it. A surviving mutant is a line the tests run but do not check.
+- **The test pyramid, split by build tag.** Unit tests (no tag, `-race`),
+  integration tests (`//go:build integration`: real bbolt/tsdb files, `httptest`,
+  gRPC over `bufconn`, WAL crash/torn/corrupt recovery, tenant isolation against
+  a real store), and an **e2e suite** (`//go:build e2e`, `test/e2e/`) that builds
+  the real binaries and runs them as separate processes on `:0` ports, reading
+  the bound address back from the server's structured log.
+- **`Makefile`**: `test-unit|test-integration|test-e2e|test-all`, `cover`,
+  `fuzz`/`fuzz-long`, `bench`/`bench-save`/`bench-compare`, `mutate`, and
+  `profile-cpu|heap|trace`.
+- **CI** (`.github/workflows`): the pyramid per push (lint, unit+coverage,
+  integration, e2e, a 15s fuzz smoke, and an informational `benchcmp` on PRs);
+  a separate workflow for 10-minute fuzzing and mutation testing, run on demand
+  (`workflow_dispatch`) — its nightly cron is committed but commented out, so a
+  fork does not spend Actions minutes unattended.
+- A **separate pprof listener** (`-pprof-addr`, off by default) and optional
+  mutex/block profile sampling (`-mutex-profile-fraction`, `-block-profile-rate`).
+  The server now logs the addresses it actually bound, which is how the e2e suite
+  discovers a `:0` port.
+
+### Fixed
+
+- **Non-injective series key (data corruption).** `SeriesKey` encoded a metric as
+  `name{k=v,...}` with no escaping, so `{a: "b,c=d"}` and `{a: "b", c: "d"}` — and
+  a name like `cpu{a=b}` against `cpu` with `{a: "b"}` — produced the *same* key.
+  Two distinct series merged silently: points from one were returned by queries
+  for the other, and the stored label set was whichever writer arrived first,
+  across the memory, bolt and tsdb backends. Found by a fuzzed injectivity
+  invariant. Fixed with a backslash-escaped, invertible encoding (`ParseSeriesKey`
+  is the proof it cannot collide), a no-op for the clean keys real agents produce.
+  Benchmark-driven optimization of the new encoder made it *faster* than the
+  broken one it replaced: 4→1 allocations, −19% time at three labels.
+- **Alert-fingerprint collision (alerts silently suppressed).** The same defect
+  class in `alert.Fingerprint`: the label separator was neither escaped nor
+  length-framed, so two different alerts could share a fingerprint and one would
+  suppress the other in the dedup and grouping paths. Fixed by length-prefixing
+  every hashed field.
+- **Unbounded allocation in WAL replay (crash-loop DoS).** `Replay` read a
+  `uint32` record length off the wire and did `make([]byte, length)`, so a torn or
+  hostile header of `0xFFFFFFFF` allocated 4 GiB on startup. Now bounded by
+  `maxRecordSize`, treating an oversized length like any other corrupt record.
+- **int64 overflow in the chunk bounds check.** A corrupt `index.json` with a
+  length near `math.MaxInt64` overflowed the `offset+length` guard, wrapped
+  negative, passed the check and panicked with an out-of-range slice. Rewritten to
+  compare each term against the data length separately.
+- **NaN/Inf accepted over gRPC, rejected over HTTP.** `encoding/json` cannot carry
+  a non-finite float, so the HTTP path rejected it at decode; protobuf carries it
+  fine and `Metric.Validate` did not check, so a gRPC client could store a value
+  an HTTP client could not. Closed at the shared `Validate` gate.
+- **Unbounded per-agent map in the rate limiter (memory-exhaustion DoS).** One
+  token bucket per key with no eviction, and the key is an attacker-chosen agent
+  id or client IP: a stream of distinct keys grew the map until the process was
+  OOM-killed, every request inside its own limit. Fixed with an idle sweep plus a
+  hard cap and amortised batch eviction.
+- **Storage write failures vanished from the pipeline counters.** A failed
+  `WriteBatch` dropped its metrics silently; `ingested` would exceed
+  `stored + invalid` with no counter to say by how much. Added a `failed` counter
+  (and a dashboard tile), restoring the conservation identity
+  `ingested == stored + invalid + failed`.
+
+### Security
+
+- pprof is no longer served on the API listener. `/debug/pprof/cmdline` exposes
+  the process's argv (which can hold `-jwt-hs256-secret`) and `/debug/pprof/heap`
+  exposes stored data; both now require an operator to bind `-pprof-addr`, and a
+  non-loopback bind is warned about.
+- The rate-limiter and series-key/fingerprint fixes above are each a
+  denial-of-service or data-integrity issue closed in shipped code.
+
 ## [0.8.0] - 2026-07-09
 
 `metricsctl`: a command-line client. Until now every interaction went through
@@ -383,7 +495,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.5.0...v0.6.0

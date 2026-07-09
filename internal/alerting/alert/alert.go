@@ -5,7 +5,9 @@ package alert
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"hash"
 	"sort"
 	"strings"
 	"time"
@@ -152,15 +154,25 @@ func LabelsString(labels map[string]string) string {
 // without that, dedup breaks and every evaluation re-notifies.
 func Fingerprint(ruleID string, labels map[string]string) string {
 	h := sha256.New()
-	h.Write([]byte(ruleID))
-	h.Write([]byte{0})
+	hashField(h, ruleID)
 	for _, k := range sortedKeys(labels) {
-		h.Write([]byte(k))
-		h.Write([]byte{'='})
-		h.Write([]byte(labels[k]))
-		h.Write([]byte{0})
+		hashField(h, k)
+		hashField(h, labels[k])
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// hashField feeds s to h behind an explicit length prefix so field boundaries
+// are unambiguous. A plain key='='+value+NUL join collided whenever a key held
+// an '=' or a value spanned a separator: {"a=b":"c"} and {"a":"b=c"} produced
+// the same bytes and thus the same fingerprint, so one alert silently took over
+// the other's identity in dedup and grouping. Length-prefixing makes the encoding
+// injective, which is the property a fingerprint actually needs.
+func hashField(h hash.Hash, s string) {
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+	h.Write(n[:])
+	h.Write([]byte(s))
 }
 
 // SortAlerts orders alerts by fingerprint so group payloads are deterministic.

@@ -95,7 +95,11 @@ func main() {
 	if authn != nil {
 		mws = append(mws, server.Authenticate(authn, logger))
 	}
-	srv := server.New(cfg.addr, server.Chain(handler.Routes(), mws...), logger)
+	srv, err := server.New(cfg.addr, server.Chain(handler.Routes(), mws...), logger)
+	if err != nil {
+		logger.Error("http listen failed", "addr", cfg.addr, "error", err)
+		os.Exit(1)
+	}
 
 	// Optional gRPC transport, sharing the same pipeline, store and auth as HTTP.
 	var grpcSrv *grpcserver.Server
@@ -104,6 +108,18 @@ func main() {
 		grpcSrv, err = grpcserver.New(cfg.grpcAddr, svc, authn, logger)
 		if err != nil {
 			logger.Error("grpc listen failed", "addr", cfg.grpcAddr, "error", err)
+			os.Exit(1)
+		}
+	}
+
+	// Optional profiling listener, on its own port so pprof is never reachable
+	// from wherever the API is.
+	server.EnableProfileSampling(cfg.mutexProfileFraction, cfg.blockProfileRate, logger)
+	var pprofSrv *server.Server
+	if cfg.pprofAddr != "" {
+		pprofSrv, err = server.NewProfilingServer(cfg.pprofAddr, logger)
+		if err != nil {
+			logger.Error("pprof listen failed", "addr", cfg.pprofAddr, "error", err)
 			os.Exit(1)
 		}
 	}
@@ -131,7 +147,7 @@ func main() {
 	// Run both transports concurrently. Each cancels the shared context on
 	// failure so the other drains too.
 	var wg sync.WaitGroup
-	errs := make(chan error, 3)
+	errs := make(chan error, 4)
 	run := func(name string, r interface{ Run(context.Context) error }) {
 		defer wg.Done()
 		if err := r.Run(ctx); err != nil {
@@ -142,13 +158,22 @@ func main() {
 
 	wg.Add(1)
 	go run("http", srv)
+
+	// Log the addresses actually bound, not the ones requested: with ":0" the
+	// kernel picks the port, and a test (or an operator) needs to be told which.
+	// These lines are the e2e suite's readiness signal.
+	fields := []any{"http_addr", srv.Addr(), "storage", cfg.storageType}
 	if grpcSrv != nil {
 		wg.Add(1)
 		go run("grpc", grpcSrv)
-		logger.Info("server started", "http_addr", cfg.addr, "grpc_addr", cfg.grpcAddr, "storage", cfg.storageType)
-	} else {
-		logger.Info("server started", "http_addr", cfg.addr, "storage", cfg.storageType)
+		fields = append(fields, "grpc_addr", grpcSrv.Addr())
 	}
+	if pprofSrv != nil {
+		wg.Add(1)
+		go run("pprof", pprofSrv)
+		fields = append(fields, "pprof_addr", pprofSrv.Addr())
+	}
+	logger.Info("server started", fields...)
 	// Alerting reads storage, so it stops with the servers — before the store is
 	// closed below.
 	if alertSvc != nil {
@@ -308,6 +333,10 @@ type config struct {
 
 	uiEnabled bool
 
+	pprofAddr            string
+	mutexProfileFraction int
+	blockProfileRate     int
+
 	alertingEnabled bool
 	alertRulesFile  string
 	alertConfigFile string
@@ -336,6 +365,10 @@ func loadConfig() config {
 		jwtAudience:     envString("JWT_AUDIENCE", ""),
 		uiEnabled:       envBool("UI", true),
 
+		pprofAddr:            envString("PPROF_ADDR", ""),
+		mutexProfileFraction: envInt("MUTEX_PROFILE_FRACTION", 0),
+		blockProfileRate:     envInt("BLOCK_PROFILE_RATE", 0),
+
 		alertingEnabled: envBool("ALERTING", false),
 		alertRulesFile:  envString("ALERT_RULES_FILE", ""),
 		alertConfigFile: envString("ALERT_CONFIG_FILE", ""),
@@ -361,6 +394,9 @@ func loadConfig() config {
 	flag.StringVar(&cfg.jwtIssuer, "jwt-issuer", cfg.jwtIssuer, "required JWT issuer (optional)")
 	flag.StringVar(&cfg.jwtAudience, "jwt-audience", cfg.jwtAudience, "required JWT audience (optional)")
 	flag.BoolVar(&cfg.uiEnabled, "ui", cfg.uiEnabled, "serve the embedded live dashboard at /")
+	flag.StringVar(&cfg.pprofAddr, "pprof-addr", cfg.pprofAddr, "listen address for net/http/pprof (empty to disable; use a loopback address)")
+	flag.IntVar(&cfg.mutexProfileFraction, "mutex-profile-fraction", cfg.mutexProfileFraction, "record 1 in N mutex contention events (0 to disable)")
+	flag.IntVar(&cfg.blockProfileRate, "block-profile-rate", cfg.blockProfileRate, "sample one blocking event per N nanoseconds blocked (0 to disable)")
 	flag.BoolVar(&cfg.alertingEnabled, "alerting", cfg.alertingEnabled, "enable rule evaluation and notifications")
 	flag.StringVar(&cfg.alertRulesFile, "alert-rules", cfg.alertRulesFile, "path to a bootstrap alerting rules JSON file")
 	flag.StringVar(&cfg.alertConfigFile, "alert-config", cfg.alertConfigFile, "path to the alerting receivers/routing JSON file")

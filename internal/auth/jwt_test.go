@@ -24,13 +24,13 @@ func mintHS256(secret []byte, claims map[string]any) string {
 	return signing + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func mintRS256(t *testing.T, key *rsa.PrivateKey, kid string, claims map[string]any) string {
-	t.Helper()
+func mintRS256(tb testing.TB, key *rsa.PrivateKey, kid string, claims map[string]any) string {
+	tb.Helper()
 	signing := b64(map[string]any{"alg": "RS256", "typ": "JWT", "kid": kid}) + "." + b64(claims)
 	sum := sha256.Sum256([]byte(signing))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, sum[:])
 	if err != nil {
-		t.Fatalf("sign: %v", err)
+		tb.Fatalf("sign: %v", err)
 	}
 	return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
 }

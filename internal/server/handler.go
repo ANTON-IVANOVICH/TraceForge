@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"net/http/pprof"
 	"net/url"
 	"strconv"
 	"time"
@@ -57,7 +56,10 @@ func (h *Handler) SetUI(hub *live.Hub, authn auth.Authenticator) {
 // SetAlerting enables the alerting API. Call before Routes.
 func (h *Handler) SetAlerting(svc *alerting.Service) { h.alerting = svc }
 
-// Routes builds the mux with the API, health, self-stats and pprof endpoints.
+// Routes builds the mux with the API, health and self-stats endpoints.
+//
+// pprof is deliberately absent: it lives on its own listener, off by default.
+// See NewProfilingServer.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/metrics", h.ingest)
@@ -69,13 +71,6 @@ func (h *Handler) Routes() http.Handler {
 	if h.alerting != nil {
 		h.alertRoutes(mux)
 	}
-
-	// Runtime profiling (net/http/pprof).
-	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 
 	// Embedded dashboard + live WebSocket (only when enabled via SetUI).
 	if h.hub != nil {

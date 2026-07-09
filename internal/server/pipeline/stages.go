@@ -75,6 +75,11 @@ func (p *Pipeline) storeStage(_ int) {
 			return
 		}
 		if err := p.storage.WriteBatch(batch); err != nil {
+			// These metrics passed validation and are now gone. Without this
+			// counter they would vanish from every total, and the only trace of a
+			// failing disk would be a log line: ingested would silently exceed
+			// stored + invalid, and nobody would know by how much or since when.
+			p.stats.IncFailed(int64(len(batch)))
 			p.logger.Error("store batch failed", "error", err, "count", len(batch))
 		} else {
 			p.stats.IncStored(int64(len(batch)))

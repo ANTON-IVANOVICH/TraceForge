@@ -7,5 +7,11 @@
 *.out
 *.test
 coverage.out
+coverage.html
 .DS_Store
 STORY.md
+
+# Benchmark runs (`make bench-save`) and profiles (`make profile-*`). Both are
+# machine-specific: committing them would invite comparing a laptop against CI.
+/.bench/
+/.prof/

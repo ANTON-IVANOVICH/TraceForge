@@ -17,6 +17,16 @@ import (
 const (
 	recordTypeWrite = 1
 	headerSize      = 4 + 4 + 1 // length(4) + crc(4) + type(1)
+
+	// maxRecordSize bounds the payload length Replay will trust from a header
+	// before allocating for it. A record is one JSON-encoded model.Metric — a
+	// name, a float, a timestamp and a handful of labels — which runs to a few
+	// hundred bytes; even a pathological label set is a few kilobytes. 16 MiB is
+	// several orders of magnitude above that, so any header claiming more is not a
+	// real record but a corrupt or torn one (a crash can leave 0xFFFFFFFF on the
+	// wire, which would otherwise make startup allocate 4 GiB). Such a length is
+	// treated exactly like a bad CRC: replay stops cleanly.
+	maxRecordSize = 16 << 20
 )
 
 // WAL is a single append-only log segment.
@@ -47,7 +57,18 @@ func Open(path string) (*WAL, error) {
 }
 
 // Write appends one record to the buffer. It does not fsync — Sync does.
+//
+// A payload larger than maxRecordSize is rejected here rather than written,
+// because Replay refuses to read one: writing a record the log cannot replay
+// would be silent data loss on the next restart. Today no caller comes close —
+// a record is one metric, and ingest caps the request body far below the limit —
+// so this only holds the invariant for a future caller who batches or lifts that
+// cap.
 func (w *WAL) Write(payload []byte) error {
+	if len(payload) > maxRecordSize {
+		return fmt.Errorf("wal: record of %d bytes exceeds the %d-byte limit", len(payload), maxRecordSize)
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -112,9 +133,10 @@ func (w *WAL) Close() error {
 }
 
 // Replay reads every intact record from the log at path and passes its payload
-// to handler. A missing file, a torn header/payload (crash mid-write) or a bad
-// CRC ends replay cleanly rather than erroring — the last record after a crash
-// is often half-written, and that must be survivable.
+// to handler. A missing file, a torn header/payload (crash mid-write), a bad CRC
+// or an implausibly large record length ends replay cleanly rather than
+// erroring — the last record after a crash is often half-written, and that must
+// be survivable.
 func Replay(path string, handler func(payload []byte) error) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -123,7 +145,7 @@ func Replay(path string, handler func(payload []byte) error) error {
 		}
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	reader := bufio.NewReaderSize(f, 64*1024)
 	var header [headerSize]byte
@@ -143,6 +165,9 @@ func Replay(path string, handler func(payload []byte) error) error {
 		expectedCRC := binary.BigEndian.Uint32(header[4:8])
 		// header[8] is the record type — only writes exist for now.
 
+		if length > maxRecordSize {
+			return nil // implausible length: corrupt or torn header, stop cleanly
+		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			return nil // torn payload

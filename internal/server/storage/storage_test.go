@@ -7,19 +7,7 @@ import (
 	"metrics-system/internal/model"
 )
 
-func TestSeriesKeyCanonical(t *testing.T) {
-	k1 := SeriesKey("cpu", map[string]string{"b": "2", "a": "1"})
-	k2 := SeriesKey("cpu", map[string]string{"a": "1", "b": "2"})
-	if k1 != k2 {
-		t.Fatalf("keys differ regardless of insertion order: %q vs %q", k1, k2)
-	}
-	if want := "cpu{a=1,b=2}"; k1 != want {
-		t.Errorf("key = %q, want %q", k1, want)
-	}
-	if k := SeriesKey("cpu", nil); k != "cpu" {
-		t.Errorf("no-label key = %q, want cpu", k)
-	}
-}
+// The series key has its own file: see serieskey_test.go.
 
 func TestMemoryStorage_WriteQueryRaw(t *testing.T) {
 	s := NewMemoryStorage()

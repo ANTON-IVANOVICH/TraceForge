@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a PR makes the previous run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  # The pyramid is split across jobs rather than run in one script, so a broken
+  # e2e test does not hide a lint failure and the slow layers run in parallel
+  # with the fast ones.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^bin/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      # vet each build tag: code behind //go:build integration is invisible to a
+      # plain vet, and rots quietly until the day someone runs it.
+      - name: go vet
+        run: |
+          go vet ./...
+          go vet -tags=integration ./...
+          go vet -tags=e2e ./test/e2e/...
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # -race is non-negotiable. A data race is not reproducible on demand: it
+      # shows up under load, on someone else's machine, in production. The
+      # detector finds it deterministically, here, for the price of a slow test.
+      #
+      # -count=1 defeats the test cache, which would otherwise report a pass for
+      # code it never ran. -covermode=atomic is required with -race.
+      - name: unit tests
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: integration tests
+        run: go test -race -count=1 -tags=integration -timeout=10m ./...
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The suite builds the binaries itself, so there is no `make build` step to
+      # fall out of sync with it.
+      - name: e2e tests
+        run: go test -count=1 -tags=e2e -timeout=15m ./test/e2e/...
+
+  # Every fuzz target's seed corpus and every committed crasher already run in
+  # the unit job. This job spends a little time looking for new inputs, which is
+  # what a fuzzer is for. The long run is nightly.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: fuzz every target briefly
+        run: make fuzz FUZZTIME=15s
+
+      # A crasher found on CI is worthless if it dies with the runner.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: "**/testdata/fuzz/**"
+
+  # Benchmarks on a shared CI runner are noisy — a neighbouring job can move a
+  # number by 30%. benchcmp answers with a p-value instead of a percentage, so a
+  # noisy pair reads "~" rather than "regression". Informational, never blocking.
+  bench:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: benchmark the base branch
+        run: |
+          git checkout --detach origin/${{ github.base_ref }}
+          go test -run=XXX -bench=. -benchmem -count=6 ./... > /tmp/base.txt 2>/dev/null || true
+
+      - name: benchmark this branch
+        run: |
+          git checkout --detach ${{ github.sha }}
+          go test -run=XXX -bench=. -benchmem -count=6 ./... > /tmp/new.txt
+
+      - name: compare
+        run: |
+          go build -o /tmp/benchcmp ./cmd/benchcmp
+          echo '## Benchmark comparison' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          /tmp/benchcmp /tmp/base.txt /tmp/new.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

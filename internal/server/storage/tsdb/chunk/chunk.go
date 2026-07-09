@@ -226,7 +226,13 @@ func (r *Reader) ReadSeries(key string, from, to time.Time) ([]storage.Point, er
 	if !ok {
 		return nil, nil
 	}
-	if e.Offset < headerSize || e.Length < 4 || e.Offset+e.Length > int64(len(r.data)) {
+	// Bounds are validated without ever computing e.Offset+e.Length: a corrupt
+	// index (this struct comes straight from index.json) can carry a length near
+	// math.MaxInt64, and that sum overflows to a negative that sails past a naive
+	// `> len(data)` check — then the slice expression panics with an out-of-range
+	// index. Comparing each term against len(data) separately keeps it safe.
+	if e.Offset < headerSize || e.Length < 4 ||
+		e.Offset > int64(len(r.data)) || e.Length > int64(len(r.data))-e.Offset {
 		return nil, fmt.Errorf("chunk %s: series %q out of bounds", r.dir, key)
 	}
 	block := r.data[e.Offset : e.Offset+e.Length]

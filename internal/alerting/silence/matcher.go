@@ -120,8 +120,16 @@ func (m Matcher) Match(labels map[string]string) bool {
 }
 
 // String renders the matcher back to its text form, e.g. `host="web-1"`.
+//
+// The value is wrapped in quotes literally, never with %q: ParseMatcher strips
+// the surrounding quotes without interpreting escapes (so regex backslashes
+// survive), so an escaping printer would not round-trip — `host="a\"b"` would
+// re-parse to the value `a\"b` rather than `a"b`. Literal quoting is the exact
+// inverse of that literal stripping. The outer quotes remain recoverable even
+// when the value itself contains a quote, because ParseMatcher only removes one
+// quote from each end.
 func (m Matcher) String() string {
-	return fmt.Sprintf("%s%s%q", m.Name, m.Op, m.Value)
+	return m.Name + string(m.Op) + `"` + m.Value + `"`
 }
 
 // valid reports whether the matcher is usable: a known operator and, for the

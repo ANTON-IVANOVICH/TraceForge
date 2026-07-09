@@ -417,10 +417,57 @@ Priority: defaults → environment variables → flags.
 
 ## Testing & profiling
 
+The test suite is a pyramid: a wide base of fast unit tests, a middle of
+integration tests against real dependencies, and a thin top of end-to-end tests
+that run the actual binaries. Each layer is a separate `make` target and a
+separate build tag, so the fast layer stays fast.
+
 ```bash
-make test                                                    # race + coverage
-go test -bench=. -benchmem ./internal/server/pipeline/       # throughput benchmark
-go tool pprof 'http://localhost:8080/debug/pprof/profile?seconds=10'   # quote for zsh; keep < 15s WriteTimeout
+make test              # unit: -race, no build tag, milliseconds each
+make test-integration  # //go:build integration: real bbolt/tsdb files, httptest, bufconn
+make test-e2e          # //go:build e2e: builds the binaries, runs them as processes
+make test-all          # all three
+make cover             # -covermode=atomic coverage; open with `make cover-html`
+```
+
+**Fuzzing.** Seventeen fuzz targets cover the parsers and codecs that touch
+untrusted bytes — the rule DSL, the WAL replay, the chunk reader, the JWT
+verifier, protobuf and JSON decoding, and the series-key encoding. They assert
+*invariants* (round-trip, injectivity, conservation), not merely "does not
+panic". A plain `go test` replays every committed corpus entry; `make fuzz`
+looks for new inputs.
+
+```bash
+make fuzz                                # 15s per target
+make fuzz FUZZTIME=10m                    # the nightly depth
+```
+
+**Benchmarks and `benchcmp`.** `make bench` runs the suite; `benchcmp`
+(`cmd/benchcmp`, written here rather than pulled in) reports whether a change is
+*statistically significant* using a Mann-Whitney U test, so noise reads as `~`
+rather than a phantom regression.
+
+```bash
+git switch main    && make bench-save NAME=base
+git switch mybranch && make bench-save NAME=new
+make bench-compare OLD=base NEW=new
+```
+
+**Mutation testing.** `make mutate PKG=./internal/alerting/rules` edits one
+operator at a time (`>` → `>=`, `&&` → `||`) and reruns the tests; a mutant that
+survives is a line the tests execute but never check — a hole coverage cannot
+see. The tester (`cmd/mutate`) uses `go test -overlay`, so it never copies the
+tree.
+
+**Profiling.** pprof lives on its own listener, off by default, because
+`/debug/pprof/cmdline` exposes the process's argv and `/heap` exposes the data:
+
+```bash
+./bin/server -pprof-addr=127.0.0.1:6060 &                 # loopback only
+make profile-cpu   PROF_PKG=./internal/server/storage      # flame graph from a benchmark
+make profile-heap  PROF_PKG=./internal/server/storage      # alloc_space
+make profile-trace PROF_PKG=./internal/server/pipeline     # go tool trace: why it won't scale
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=10'
 ```
 
 ## Milestones
@@ -451,3 +498,17 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
   `0600` credentials, `table|json|yaml|name` output, declarative idempotent
   `rules apply -f`, `alerts list --watch`, silences, dynamic shell completion,
   TTY/`NO_COLOR` manners, and POSIX exit codes.
+- **v0.9.0** — Testing, benchmarking & profiling as a discipline: the test
+  pyramid split by build tag (unit/integration/e2e); 17 invariant-based fuzz
+  targets; a benchmark suite; `benchcmp` (a from-scratch benchstat with a
+  Mann-Whitney U test) and `mutate` (a from-scratch mutation tester on
+  `go test -overlay`); a goroutine-leak detector; and pprof moved to its own
+  listener. The fuzzers found and fixed real bugs: a **non-injective series
+  key** and a matching **alert-fingerprint collision** (two distinct series or
+  alerts silently merging), an **unbounded allocation** in WAL replay, an
+  **int64 overflow** in the chunk bounds check, a **NaN/Inf** value that gRPC
+  accepted but HTTP rejected, and an **unbounded per-agent map** in the rate
+  limiter (a memory-exhaustion DoS). CI runs the pyramid per push; a separate
+  workflow carries longer fuzzing and mutation testing, dispatchable by hand (its
+  nightly cron is committed but left commented, so a fork does not run it
+  unattended).

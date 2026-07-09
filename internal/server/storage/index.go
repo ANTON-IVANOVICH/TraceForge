@@ -1,8 +1,6 @@
 package storage
 
 import (
-	"sort"
-	"strings"
 	"time"
 )
 
@@ -35,34 +33,6 @@ func (ix *index) seriesForName(name string) []*Series {
 		out = append(out, s)
 	}
 	return out
-}
-
-// SeriesKey canonicalizes a metric into a stable key. Labels are sorted so
-// {host=a,region=b} and {region=b,host=a} collapse to the same series. Backends
-// use it as the on-disk key for a series.
-func SeriesKey(name string, labels map[string]string) string {
-	if len(labels) == 0 {
-		return name
-	}
-	keys := make([]string, 0, len(labels))
-	for k := range labels {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var b strings.Builder
-	b.WriteString(name)
-	b.WriteByte('{')
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(labels[k])
-	}
-	b.WriteByte('}')
-	return b.String()
 }
 
 // CloneLabels returns a copy of in (nil for an empty map) so callers can't

@@ -29,8 +29,8 @@ func actionForRequest(r *http.Request) (auth.Action, bool) {
 	case r.Method == http.MethodGet && isAlertingPath(r.URL.Path):
 		return auth.ActionQuery, true
 	default:
-		// Mutating rules and silences, /debug/stats, /debug/pprof/* and anything
-		// else are privileged.
+		// Mutating rules and silences, /debug/stats and anything else are
+		// privileged. (pprof is not served here at all — see profiling.go.)
 		return auth.ActionAdmin, true
 	}
 }

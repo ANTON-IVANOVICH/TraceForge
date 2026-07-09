@@ -131,6 +131,9 @@ function updateStats(stats) {
   $("c-stored").textContent = fmt(p.stored ?? 0);
   $("c-dropped").textContent = fmt(p.dropped ?? 0);
   $("c-invalid").textContent = fmt(p.invalid ?? 0);
+  // Distinct from `dropped`: these metrics were accepted and then lost to a
+  // storage write error. Any non-zero value here is an incident.
+  $("c-failed").textContent = fmt(p.failed ?? 0);
   $("c-series").textContent = fmt(s.series ?? 0);
   $("c-points").textContent = fmt(s.points ?? 0);
   $("chart-hint").style.display = "none";

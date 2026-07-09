@@ -29,7 +29,7 @@ func TestChunk_WriteReadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	key := storage.SeriesKey("cpu", map[string]string{"host": "a"})
 	pts, err := r.ReadSeries(key, time.Time{}, time.Time{})
@@ -77,11 +77,38 @@ func TestChunk_WriteIsAtomic(t *testing.T) {
 	}
 }
 
-func FuzzParseHeader(f *testing.F) {
-	f.Add([]byte("TSDB\x01"))
-	f.Add([]byte(""))
-	f.Add([]byte("XXXX\x00"))
-	f.Fuzz(func(_ *testing.T, data []byte) {
-		_ = ParseHeader(data) // must never panic
-	})
+// TestReadSeries_CorruptIndexBoundsRejected is the deterministic sibling of
+// FuzzReadSeriesCorruptIndex: it hand-writes an index.json whose length field
+// overflows int64 addition. Before the bounds check was rewritten to compare
+// each term against len(data) separately, Offset+Length wrapped negative, sailed
+// past `> len(data)`, and the slice expression panicked with an out-of-range
+// index on a plain query.
+func TestReadSeries_CorruptIndexBoundsRejected(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	indexes := map[string]string{
+		"length overflows int64": `{"series":{"cpu":{"name":"cpu","type":"gauge","offset":9,"length":9223372036854775807}},"min_time":0,"max_time":0,"points":1}`,
+		"offset past data":       `{"series":{"cpu":{"name":"cpu","type":"gauge","offset":1000000,"length":16}},"min_time":0,"max_time":0,"points":1}`,
+		"offset before header":   `{"series":{"cpu":{"name":"cpu","type":"gauge","offset":0,"length":16}},"min_time":0,"max_time":0,"points":1}`,
+	}
+	for name, idx := range indexes {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "chunk")
+			if err := Write(dir, []storage.Series{
+				{Name: "cpu", Type: model.MetricTypeGauge, Points: []storage.Point{{Timestamp: base, Value: 1}}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "index.json"), []byte(idx), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			r, err := Open(dir)
+			if err != nil {
+				return // a rejected index is a fine outcome
+			}
+			defer func() { _ = r.Close() }()
+			if _, err := r.ReadSeries("cpu", time.Time{}, time.Time{}); err == nil {
+				t.Fatal("out-of-bounds series entry must return an error, not read")
+			}
+		})
+	}
 }

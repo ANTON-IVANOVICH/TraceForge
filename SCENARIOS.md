@@ -4,7 +4,7 @@ A catalog of end-to-end flows the system supports, written as runnable recipes.
 This file is maintained alongside the staged roadmap: each milestone that adds a
 user-visible capability also adds or updates the relevant scenarios here.
 
-- **Covers up to:** v0.8.0 (metricsctl CLI)
+- **Covers up to:** v0.9.0 (testing, benchmarking & profiling)
 - **Last updated:** 2026-07-09
 
 Conventions used below:
@@ -643,6 +643,58 @@ rules exist; `metricsctl --context <TAB>` lists the configured contexts.
 | Destructive CLI command in a script | `metricsctl rules delete x` (no TTY, no `--yes`) | exit `2`, nothing deleted |
 | Bad rule manifest | `metricsctl rules apply -f bad.yaml` | exit `2`, nothing written |
 | Loose config permissions | `chmod 644 ~/.metricsctl/config.yaml` | warning on every invocation |
+| Series with delimiters in labels | `{a: "b,c=d"}` vs `{a: "b", c: "d"}` | stored as two distinct series (escaped, injective key) |
+| Non-finite value over gRPC | a NaN/Inf metric via the gRPC transport | rejected by `Validate`, same as the HTTP path |
+| Corrupt / torn WAL on restart | crash mid-write, or a flipped byte | replay stops cleanly at the bad record; the process starts |
+| Hostile WAL record length | a header claiming a 4 GiB payload | treated as corruption, not allocated |
+| Rate-limiter key flood | a stream of distinct agent ids / IPs | bucket map capped and swept, not grown until OOM |
+| Storage write failure | `WriteBatch` errors (full disk) | metrics counted in `stats.failed`, surfaced on the dashboard |
+| pprof on the API port | `GET /debug/pprof/` without `-pprof-addr` | `404` — profiling is a separate, opt-in listener |
+
+---
+
+## 10. Developer workflows — testing, benchmarking, profiling
+
+The whole point of stage 9: the tools an engineer reaches for when a green build
+is not enough. All are `make` targets; none pull in an external dependency.
+
+```bash
+# The test pyramid, by build tag.
+make test              # unit: -race, milliseconds each — the base
+make test-integration  # //go:build integration: real bbolt/tsdb, httptest, bufconn
+make test-e2e          # //go:build e2e: builds the binaries, runs them as processes
+make cover             # atomic-mode coverage; `make cover-html` to browse it
+
+# Fuzzing. A plain `go test` already replays every committed crasher; these hunt
+# for new inputs. The targets assert invariants (round-trip, injectivity), so a
+# failure is a real bug, not a stray panic.
+make fuzz                    # 15s per target — CI-on-PR depth
+make fuzz FUZZTIME=10m       # the nightly depth
+
+# Benchmarking with a significance test. One run is an anecdote; ten are a
+# sample. benchcmp reports `~` when the difference is within the noise.
+git switch main    && make bench-save NAME=base
+git switch mybranch && make bench-save NAME=new
+make bench-compare OLD=base NEW=new
+#   SeriesKey/labels=3   156.9 ± 3%   128.0 ± 1%   -18.48% (p=0.000 n=10+10)
+#   SeriesKey/labels=1    79.6 ± 3%    81.4 ± 3%   ~ (p=0.054 n=10+10)
+
+# Mutation testing: does the suite check the lines it covers?
+make mutate PKG=./internal/alerting/rules
+#   SURVIVED  rules/manager.go:78: conditional: > -> >=
+#   mutation score: 84.2% (...)
+
+# Profiling. pprof is a separate listener, off by default, bound to loopback.
+./bin/server -pprof-addr=127.0.0.1:6060 &
+make profile-cpu   PROF_PKG=./internal/server/storage   # flame graph from a benchmark
+make profile-trace PROF_PKG=./internal/server/pipeline  # go tool trace: why it won't scale
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=10'
+```
+
+The bugs this stage's fuzzers and benchmarks turned up — a non-injective series
+key, an alert-fingerprint collision, an unbounded WAL allocation, a chunk
+overflow, a gRPC-only NaN, an unbounded rate-limiter map — are in the failure
+table above and detailed in `CHANGELOG.md`.
 
 ---
 

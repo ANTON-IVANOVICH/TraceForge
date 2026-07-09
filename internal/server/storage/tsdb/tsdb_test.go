@@ -8,6 +8,7 @@ import (
 
 	"metrics-system/internal/model"
 	"metrics-system/internal/server/storage"
+	"metrics-system/internal/testutil"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -38,7 +39,7 @@ func TestTSDB_RecoveryFromWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	got, err := db2.Query(storage.Query{Name: "test", From: base.Add(-time.Hour), To: base.Add(time.Hour)})
 	if err != nil {
@@ -61,7 +62,7 @@ func TestTSDB_FlushThenQueryAndMerge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	for i := 0; i < 10; i++ {
 		if err := db.Write(gauge("m", float64(i), base.Add(time.Duration(i)*time.Second))); err != nil {
@@ -123,7 +124,7 @@ func TestTSDB_PersistAcrossFlushAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	got, err := db2.Query(storage.Query{Name: "m"})
 	if err != nil {
@@ -144,7 +145,7 @@ func TestTSDB_Aggregation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	for i, v := range []float64{10, 20, 30, 40} {
 		_ = db.Write(gauge("m", v, base.Add(time.Duration(i)*time.Second)))
@@ -162,13 +163,37 @@ func TestTSDB_Aggregation(t *testing.T) {
 	}
 }
 
+// Open starts two background loops (sync + flush); Close cancels their context
+// and waits on the WaitGroup. The leak detector proves they actually stop — a
+// missed wg.Done or a loop that ignored ctx.Done would leave a goroutine running
+// past the test and show up here. NoLeaks is installed first, before Open, so
+// its snapshot predates the loops.
+func TestTSDB_CloseStopsBackgroundLoops(t *testing.T) {
+	defer testutil.NoLeaks(t)()
+
+	dir := t.TempDir()
+	db, err := Open(dir, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC()
+	for i := 0; i < 50; i++ {
+		if err := db.Write(gauge("m", float64(i), base.Add(time.Duration(i)*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTSDB_LockPreventsSecondOpen(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, testLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if _, err := Open(dir, testLogger()); err == nil {
 		t.Fatal("second Open of a locked dir should fail")
