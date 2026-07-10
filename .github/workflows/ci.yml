@@ -41,7 +41,11 @@ jobs:
           go vet -tags=integration ./...
           go vet -tags=e2e ./test/e2e/...
 
-      - uses: golangci/golangci-lint-action@v6
+      # v7 is the first release of the action that understands golangci-lint v2;
+      # v6 rejects the version string outright ("golangci-lint v2 is not
+      # supported by golangci-lint-action v6"). The linter version pinned here
+      # must stay in step with the one `make lint` installs.
+      - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
 
