@@ -1,0 +1,33 @@
+{{- if .Values.metrics.serviceMonitor.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "traceforge.server.fullname" . }}
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # Select the server Service and scrape its named telemetry port — the one place
+  # /metrics is actually served. Targeting the port by NAME (not number) keeps
+  # this correct even if the telemetry port value changes.
+  #
+  # `traceforge.io/scrape` narrows this to exactly one of the two server Services.
+  # The chart's selectorLabels are shared by the headless Service and the ClusterIP
+  # one, and both publish the telemetry port, so a selector built from those alone
+  # would give the operator two targets for every pod.
+  selector:
+    matchLabels:
+      {{- include "traceforge.server.selectorLabels" . | nindent 6 }}
+      traceforge.io/scrape: "true"
+  endpoints:
+    - port: telemetry
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+{{- end }}

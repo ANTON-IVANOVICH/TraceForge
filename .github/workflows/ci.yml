@@ -199,6 +199,146 @@ jobs:
       - name: cross-compile the pure-Go agent
         run: make cross-nocgo
 
+  # govulncheck is not a CVE scanner. It walks the call graph, so a vulnerable
+  # function in a dependency nothing calls does not fail this job. That precision
+  # is what makes it worth gating on: a scanner that cries wolf is a scanner
+  # somebody adds `continue-on-error` to.
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # The deployment artefacts are source code with no compiler. These are the
+  # compiler: helm renders the chart, kubeconform checks it against the Kubernetes
+  # API schemas, promtool checks the alert rules, and the Go tests in test/deploy
+  # check the things only this project knows — that every flag in a manifest is a
+  # flag the binary has, that every metric in a dashboard is one it exports, and
+  # that every alert links a runbook that exists.
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.0
+
+      - name: install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@latest
+
+      - name: helm lint
+        run: make helm-lint
+
+      - name: validate the rendered manifests against the Kubernetes schemas
+        run: make kubeconform
+
+      # deploy/k8s is generated from the chart. A rendered file nobody regenerates
+      # is a rendered file that lies about the chart it came from.
+      - name: the committed manifests match the chart
+        run: make manifests-check
+
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            --entrypoint /bin/promtool prom/prometheus:latest \
+            check config /etc/prometheus/prometheus.yml
+
+      - name: flags, metrics, dashboards and runbooks all still exist
+        run: go test -count=1 ./test/deploy/...
+
+  # The images are built, run, and asked what they are. A Dockerfile that has
+  # never produced a running container is a Dockerfile that does not work yet.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build and smoke-test the server image
+        run: make docker-smoke VERSION=ci COMMIT=${{ github.sha }}
+
+      # The exposition format in internal/promexport is written by hand. promtool
+      # is Prometheus's own validator, and it does not care what wrote the bytes.
+      - name: promtool check metrics, against a real scrape
+        run: |
+          id=$(docker run -d --rm -p 19091:9091 traceforge/server:ci -storage=memory -ui=false)
+          for i in $(seq 40); do curl -sf localhost:19091/readyz >/dev/null && break; sleep 0.5; done
+          curl -s localhost:19091/metrics > /tmp/metrics.txt
+          docker stop "$id"
+          docker run --rm -i --entrypoint /bin/promtool prom/prometheus:latest \
+            check metrics < /tmp/metrics.txt
+
+      # The claims internal/container makes are only true inside a real cgroup, so
+      # they are checked inside one. With --memory=256m the process must derive
+      # GOMEMLIMIT = 0.9 x 268435456 = 241591910; with --cpus=1.5 the Go runtime
+      # must pick GOMAXPROCS=2 on its own, without anything setting it.
+      - name: the container reads its own cgroup limits
+        run: |
+          set -euo pipefail
+          id=$(docker run -d --memory=256m --cpus=1.5 traceforge/server:ci \
+                 -storage=memory -ui=false -log-level=info)
+          trap 'docker rm -f "$id" >/dev/null' EXIT
+          for i in $(seq 60); do docker logs "$id" 2>&1 | grep -q '"server started"' && break; sleep 0.5; done
+          logs=$(docker logs "$id" 2>&1)
+          echo "$logs"
+
+          echo "$logs" | grep -q '"cgroup_limit_bytes":268435456' \
+            || { echo "::error::the process did not read the cgroup memory limit"; exit 1; }
+          echo "$logs" | grep -q '"gomemlimit_bytes":241591910' \
+            || { echo "::error::GOMEMLIMIT was not derived from the cgroup limit"; exit 1; }
+          echo "$logs" | grep -q '"gomaxprocs":2' \
+            || { echo "::error::the runtime did not derive GOMAXPROCS from the 1.5-cpu quota"; exit 1; }
+
+      - name: multi-arch build (cross-compiled, no emulation)
+        run: |
+          docker buildx build -f deploy/docker/Dockerfile --target server \
+            --platform linux/amd64,linux/arm64 --build-arg VERSION=ci .
+
+      # The CGo image cannot cross-compile: cgo needs libpcap's headers for the
+      # target. It builds natively for amd64 here, which is what a release does per
+      # architecture.
+      - name: build the libpcap agent image
+        run: |
+          docker buildx build -f deploy/docker/Dockerfile --target agent-pcap \
+            --platform linux/amd64 --build-arg VERSION=ci --load -t traceforge/agent-pcap:ci .
+          docker run --rm traceforge/agent-pcap:ci -version
+
+  # A release config that only fails on the tag is a release config that fails
+  # when it is least convenient.
+  release-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: check
+      - name: build every release artefact, publish nothing
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean --skip=sign,sbom
+
   # Benchmarks on a shared CI runner are noisy — a neighbouring job can move a
   # number by 30%. benchcmp answers with a p-value instead of a percentage, so a
   # noisy pair reads "~" rather than "regression". Informational, never blocking.

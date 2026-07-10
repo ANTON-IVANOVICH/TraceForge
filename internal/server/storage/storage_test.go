@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -111,5 +113,43 @@ func TestFilterTime(t *testing.T) {
 func TestQuery_MissingName(t *testing.T) {
 	if _, err := NewMemoryStorage().Query(Query{}); err == nil {
 		t.Error("expected error for missing query name")
+	}
+}
+
+// The readiness probe calls Ping on every poll. For the in-memory store the only
+// thing it can honestly report is whether the caller is still interested.
+func TestMemoryStorage_Ping(t *testing.T) {
+	s := NewMemoryStorage()
+	if err := s.Ping(context.Background()); err != nil {
+		t.Errorf("Ping on a healthy store: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Ping(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Ping with a cancelled context = %v, want context.Canceled", err)
+	}
+}
+
+// Ping must not queue behind a write. A probe that takes the store's lock reports
+// "not ready" exactly when the server is busiest — and every replica does so at
+// the same moment, which converts a slow disk into an outage.
+func TestMemoryStorage_PingDoesNotWaitForWriters(t *testing.T) {
+	s := NewMemoryStorage()
+
+	// Hold the write lock the way a long WriteBatch would.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- s.Ping(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Ping: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ping blocked behind a writer holding the store lock")
 	}
 }

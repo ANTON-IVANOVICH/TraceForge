@@ -9,11 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 
+	"metrics-system/internal/buildinfo"
 	"metrics-system/internal/cli"
 )
-
-// version is injected at build time with -ldflags "-X main.version=v0.8.0".
-var version = "dev"
 
 func main() {
 	// A cancelled context lets long-running commands (`alerts list --watch`) stop
@@ -21,7 +19,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	root := cli.NewRootCmd(version, nil)
+	root := cli.NewRootCmd(buildinfo.Get(), nil)
 
 	if err := root.ExecuteContext(ctx); err != nil {
 		// An interrupted command is not a failure to report; the shell already

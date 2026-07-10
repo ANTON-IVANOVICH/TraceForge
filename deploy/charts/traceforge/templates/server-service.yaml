@@ -1,0 +1,69 @@
+{{/*
+Two Services on purpose:
+  - the headless Service (clusterIP: None) gives each StatefulSet pod its stable
+    per-pod DNS name, which is how anything that must address THIS server (and,
+    when clustering ships, its peers) finds it.
+  - the ClusterIP Service is the load-balanced front door agents and the UI use.
+
+Both publish the telemetry port, and exactly one of them carries
+`traceforge.io/scrape: "true"`. Without that distinction a ServiceMonitor whose
+selector matched the component label would select BOTH, and the operator would
+emit two targets for every pod — the same series, scraped twice, which Prometheus
+either double-charges for or rejects as a duplicate sample for a timestamp.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "traceforge.server.fullname" . }}-headless
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  clusterIP: None
+  # publishNotReadyAddresses so a pod still resolves by DNS during its startup
+  # drain — peers and probes need to reach it before it reports ready.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "traceforge.server.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.server.http.port }}
+      targetPort: http
+    {{- if .Values.server.grpc.enabled }}
+    - name: grpc
+      port: {{ .Values.server.grpc.port }}
+      targetPort: grpc
+    {{- end }}
+    - name: telemetry
+      port: {{ .Values.server.telemetry.port }}
+      targetPort: telemetry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "traceforge.server.fullname" . }}
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    # The one Service a ServiceMonitor may select. See the comment at the top.
+    traceforge.io/scrape: "true"
+  {{- with .Values.server.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.server.service.type }}
+  selector:
+    {{- include "traceforge.server.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.server.http.port }}
+      targetPort: http
+    {{- if .Values.server.grpc.enabled }}
+    - name: grpc
+      port: {{ .Values.server.grpc.port }}
+      targetPort: grpc
+    {{- end }}
+    - name: telemetry
+      port: {{ .Values.server.telemetry.port }}
+      targetPort: telemetry

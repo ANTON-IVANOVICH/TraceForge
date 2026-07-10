@@ -1,0 +1,71 @@
+# Production overlay. Layer with:
+#   helm install tf deploy/charts/traceforge -f values-prod.yaml
+# It turns on persistence, a real drain window, auth, network isolation and
+# operator scraping. What it does NOT do is pretend the server scales out.
+
+server:
+  # replicas: 1 — AND IT STAYS 1, EVEN IN PRODUCTION.
+  #
+  # The server is single-node. It has no replication and no consensus. Running
+  # replicas: 2 would give you TWO servers, each with its OWN independent TSDB,
+  # and NOTHING copying data between them. Agents would spray batches across both
+  # at random, so every one of them would hold roughly half the data, and every
+  # query would return whichever half it happened to hit — silent, partial, and
+  # impossible to reason about. That is data loss wearing a "high availability"
+  # costume. True HA waits for the clustering stage. Until then, one replica is
+  # not a limitation to work around; it is the honest shape of the system.
+  replicas: 1
+
+  storage: tsdb
+  logLevel: info
+
+  # Behind a load balancer: fail readiness and wait 5s so the LB pulls this
+  # endpoint out of rotation BEFORE listeners close, then a generous hard
+  # deadline. terminationGracePeriodSeconds is derived as 30 + 15 = 45s > 30s.
+  shutdown:
+    delaySeconds: 5
+    timeoutSeconds: 30
+    graceBufferSeconds: 15
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  persistence:
+    size: 100Gi
+    # Pin fast SSD; the default class is often spinning or network disk, which
+    # turns tsdb fsyncs into the process's bottleneck.
+    storageClassName: ""
+
+  topologySpreadConstraints: []
+
+  # Auth ON. The secret is pre-created out of band (sealed-secrets / external
+  # secrets / vault); the chart only references it. Uncomment and point at it:
+  auth:
+    enabled: false          # flip to true AFTER creating the Secret below
+    existingSecret: ""      # e.g. traceforge-auth  (REQUIRED when enabled)
+    hs256SecretKey: jwt-hs256-secret
+
+agent:
+  transport: http
+  interval: 15s
+  # The agent authenticates to the server; same pattern — a pre-created Secret.
+  auth:
+    existingSecret: ""      # e.g. traceforge-agent-auth
+
+# Lock ingress down to just the agents (data ports) and the monitoring namespace
+# (telemetry). Requires an enforcing CNI to actually mean anything.
+networkPolicy:
+  enabled: true
+  monitoringNamespace: monitoring
+
+# Let the Prometheus Operator discover the telemetry endpoint.
+metrics:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s

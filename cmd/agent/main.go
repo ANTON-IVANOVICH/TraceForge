@@ -9,12 +9,18 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"metrics-system/internal/agent"
 	"metrics-system/internal/agent/kernel"
 	"metrics-system/internal/agent/network"
+	"metrics-system/internal/buildinfo"
+	"metrics-system/internal/container"
+	"metrics-system/internal/promexport"
+	"metrics-system/internal/server/health"
+	"metrics-system/internal/telemetry"
 	"metrics-system/pkg/httpx"
 )
 
@@ -53,10 +59,38 @@ func main() {
 		netFile    = flag.String("network-file", envString("AGENT_NETWORK_FILE", ""), "read packets from a .pcap savefile instead of an interface")
 		netFilter  = flag.String("network-filter", envString("AGENT_NETWORK_FILTER", "ip or ip6"), "BPF filter applied in the kernel (tcpdump syntax)")
 		netSnapLen = flag.Int("network-snaplen", envInt("AGENT_NETWORK_SNAPLEN", 128), "bytes captured per packet; the headers are all that is classified")
+
+		telemetryAddr = flag.String("telemetry-addr", envString("AGENT_TELEMETRY_ADDR", ":9101"),
+			"listen address for /healthz, /readyz, /startupz and /metrics (empty to disable)")
+		memLimitRatio = flag.Float64("memory-limit-ratio", envFloat("AGENT_MEMORY_LIMIT_RATIO", 0.9),
+			"fraction of the cgroup memory limit to hand to GOMEMLIMIT (ignored when GOMEMLIMIT is set)")
+		showVersion = flag.Bool("version", false, "print the build's version, commit and platform, then exit")
+		healthCheck = flag.Bool("health-check", false,
+			"probe this container's own /readyz on -telemetry-addr and exit 0 or 1; for HEALTHCHECK in an image with no shell")
 	)
 	flag.Parse()
 
+	// Both must answer before a collector is opened or a port is bound: -version
+	// runs on a laptop, -health-check runs inside a container that already has an
+	// agent in it.
+	if *showVersion {
+		fmt.Println("traceforge-agent", buildinfo.Get())
+		return
+	}
+	if *healthCheck {
+		if err := telemetry.SelfCheck(context.Background(), *telemetryAddr); err != nil {
+			fmt.Fprintln(os.Stderr, "health check failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: parseLogLevel(*logLevel)}))
+	logger.Info("traceforge agent", "build", buildinfo.Get().String())
+
+	// An agent runs on every node, inside the tightest memory limit in the
+	// cluster. GOMAXPROCS is left to the runtime; see internal/container.
+	container.ApplyMemoryLimit(*memLimitRatio, logger)
 
 	collectors := []agent.Collector{
 		agent.NewCPUCollector(hostname),
@@ -106,8 +140,59 @@ func main() {
 	}
 	a := agent.New(*agentID, *interval, collectors, transport, logger)
 
-	if err := a.Run(ctx); err != nil {
-		logger.Error("agent terminated", "error", err)
+	// The agent's own admin surface. A DaemonSet pod nobody routes traffic to
+	// still needs a liveness probe, and the absence of a host's metrics is the
+	// hardest outage to notice — so the agent exports its own counters too.
+	//
+	// telCtx outlives ctx so that the probes keep answering while Run returns and
+	// the transport closes. A kubelet that gets connection-refused on /healthz
+	// during a graceful stop records a probe failure, not a graceful stop.
+	telCtx, stopTel := context.WithCancel(context.Background())
+	defer stopTel()
+
+	healthz := health.New(logger, health.Options{})
+	healthz.Register("collectors", a.Ready)
+
+	var telWG sync.WaitGroup
+	if *telemetryAddr != "" {
+		telSrv, err := telemetry.New(telemetry.Config{
+			Addr:   *telemetryAddr,
+			Health: healthz,
+			Gatherers: []promexport.Gatherer{
+				agent.BuildInfoGatherer(),
+				telemetry.RuntimeGatherer(),
+				a.SelfMetrics(),
+			},
+		}, logger)
+		if err != nil {
+			logger.Error("telemetry listen failed", "addr", *telemetryAddr, "error", err)
+			os.Exit(1)
+		}
+		telWG.Add(1)
+		go func() {
+			defer telWG.Done()
+			if err := telSrv.Run(telCtx); err != nil {
+				logger.Error("telemetry server failed", "error", err)
+			}
+		}()
+		go func() { _ = healthz.Run(telCtx) }()
+		logger.Info("telemetry listening", "telemetry_addr", telSrv.Addr())
+	}
+
+	// The gate is open, but /readyz still answers 503 until the "collectors" check
+	// passes — that is, until a tick has actually produced a metric. An agent that
+	// reported ready before it read a single counter would tell the rollout it
+	// works before it had tried.
+	healthz.MarkStarted()
+	healthz.SetReady(true)
+
+	runErr := a.Run(ctx)
+
+	stopTel()
+	telWG.Wait()
+
+	if runErr != nil {
+		logger.Error("agent terminated", "error", runErr)
 		os.Exit(1)
 	}
 }
@@ -222,4 +307,16 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func envFloat(key string, fallback float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return f
 }

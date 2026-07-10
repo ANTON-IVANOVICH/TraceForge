@@ -1,0 +1,177 @@
+{{- if .Values.agent.enabled -}}
+{{- $agent := .Values.agent -}}
+{{- $capture := $agent.capture.enabled -}}
+{{- $serverHost := include "traceforge.server.fullname" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "traceforge.agent.fullname" . }}
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "traceforge.agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "traceforge.agent.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if not .Values.metrics.serviceMonitor.enabled }}
+        # Mutually exclusive with the ServiceMonitor: with both present, a cluster
+        # that runs the operator and an annotation-based pod-discovery job scrapes
+        # every pod twice. See server-statefulset.yaml.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $agent.telemetry.port | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "traceforge.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      # The agent has nothing to drain — no listener carries user traffic and the
+      # next tick's batch is worth nothing — but it does hold a libpcap handle when
+      # capture is on, and Kubernetes kills what it does not wait for. Ten seconds
+      # is far more than Agent.Run needs to leave the capture loop and close the
+      # handle; it exists so that the kubelet's SIGKILL is never the thing that
+      # frees a C pointer a goroutine is still inside.
+      terminationGracePeriodSeconds: {{ .Values.agent.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $capture }}
+      # Capture reads packets off the node's real interfaces, which only exist in
+      # the host network namespace. Without this the agent would only ever see
+      # the pod's own loopback + veth, defeating the point.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      securityContext:
+        {{- if $capture }}
+        # THE PRIVILEGED EXCEPTION. A runtime-granted capability (below) lands in
+        # the permitted set of a ROOT process only; distroless has no file/ambient
+        # capabilities to promote a non-root process, so capture must run as uid 0.
+        runAsNonRoot: false
+        runAsUser: 0
+        seccompProfile:
+          type: RuntimeDefault
+        {{- else }}
+        {{- include "traceforge.podSecurityContext" . | nindent 8 }}
+        {{- end }}
+      # Tolerate ALL taints so the agent also lands on control-plane and otherwise
+      # tainted nodes — a node with no agent is a blind spot you cannot see into.
+      {{- with $agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agent
+          {{- if $capture }}
+          image: {{ include "traceforge.image" (dict "repo" $agent.capture.image.repository "tag" $agent.capture.image.tag "root" $) }}
+          imagePullPolicy: {{ $agent.capture.image.pullPolicy }}
+          {{- else }}
+          image: {{ include "traceforge.image" (dict "repo" $agent.image.repository "tag" $agent.image.tag "root" $) }}
+          imagePullPolicy: {{ $agent.image.pullPolicy }}
+          {{- end }}
+          args:
+            - -transport={{ $agent.transport }}
+            {{- if eq $agent.transport "grpc" }}
+            - -grpc-server={{ $serverHost }}:{{ .Values.server.grpc.port }}
+            {{- else }}
+            - -server=http://{{ $serverHost }}:{{ .Values.server.http.port }}/api/v1/metrics
+            {{- end }}
+            - -interval={{ $agent.interval }}
+            - -telemetry-addr=:{{ $agent.telemetry.port }}
+            - -log-level={{ $agent.logLevel }}
+            - -memory-limit-ratio={{ $agent.memoryLimitRatio }}
+            - -http-timeout={{ $agent.http.timeout }}
+            - -http-retries={{ $agent.http.retries }}
+            - -http-backoff={{ $agent.http.backoff }}
+            {{- if $capture }}
+            - -network
+            {{- if $agent.capture.file }}
+            - -network-file={{ $agent.capture.file }}
+            {{- else }}
+            - -network-device={{ $agent.capture.device }}
+            {{- end }}
+            - -network-filter={{ $agent.capture.filter }}
+            - -network-snaplen={{ $agent.capture.snaplen }}
+            {{- end }}
+            {{- with $agent.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # -id defaults to the hostname; pin it to the NODE name so every
+            # sample is attributable to a node even across pod restarts. Env, not
+            # a flag, because it comes from the downward API.
+            - name: AGENT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # NO GOMAXPROCS/GOMEMLIMIT env: since Go 1.25 the runtime derives both
+            # from the cgroup and keeps updating GOMAXPROCS; the binary sets its
+            # own soft memory limit from -memory-limit-ratio. Freezing either here
+            # would mis-size the runtime after a resize.
+            {{- if $agent.auth.existingSecret }}
+            - name: AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $agent.auth.existingSecret }}
+                  key: {{ $agent.auth.apiKeyKey }}
+                  optional: true
+            - name: AGENT_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $agent.auth.existingSecret }}
+                  key: {{ $agent.auth.bearerKey }}
+                  optional: true
+            {{- end }}
+            {{- with $agent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: telemetry
+              containerPort: {{ $agent.telemetry.port }}
+              {{- if $capture }}
+              hostPort: {{ $agent.telemetry.port }}
+              {{- end }}
+          {{- include "traceforge.probes" . | nindent 10 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              # Drop everything, then — under capture only — add back exactly the
+              # two the raw-socket capture path needs and nothing else.
+              drop:
+                - ALL
+              {{- if $capture }}
+              add:
+                - NET_RAW
+                - NET_ADMIN
+              {{- end }}
+          resources:
+            {{- toYaml $agent.resources | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem is on for the agent too, so /tmp must be a
+            # writable emptyDir for scratch space.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

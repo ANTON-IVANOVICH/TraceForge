@@ -2,10 +2,10 @@ package cli
 
 import (
 	"fmt"
-	"runtime"
 
 	"github.com/spf13/cobra"
 
+	"metrics-system/internal/buildinfo"
 	"metrics-system/internal/cli/output"
 )
 
@@ -61,14 +61,12 @@ rules that actually exist.`,
 	}
 }
 
-// Version describes the build. Fields are injected with -ldflags at build time.
-type Version struct {
-	Version   string `json:"version"`
-	GoVersion string `json:"go_version"`
-	Platform  string `json:"platform"`
-}
+// Version describes the build. It is buildinfo.Info under a name the CLI's users
+// already know, and it gains the commit and the dirty flag: "which build is this"
+// is a question a version string alone has never been able to answer.
+type Version = buildinfo.Info
 
-func newVersionCmd(version string) *cobra.Command {
+func newVersionCmd(build buildinfo.Info) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print the metricsctl version",
@@ -78,11 +76,6 @@ func newVersionCmd(version string) *cobra.Command {
 		PersistentPreRunE: func(*cobra.Command, []string) error { return nil },
 
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			v := Version{
-				Version:   version,
-				GoVersion: runtime.Version(),
-				Platform:  runtime.GOOS + "/" + runtime.GOARCH,
-			}
 			// The root's PersistentPreRunE was skipped, so there is no printer;
 			// honour -o by building one here against the command's own stream.
 			format, _ := cmd.Root().PersistentFlags().GetString("output")
@@ -91,12 +84,16 @@ func newVersionCmd(version string) *cobra.Command {
 				return &UsageError{Err: err}
 			}
 			if printer.Format() == output.FormatTable {
-				_, err := fmt.Fprintf(cmd.OutOrStdout(), "metricsctl %s (%s, %s)\n", v.Version, v.GoVersion, v.Platform)
+				_, err := fmt.Fprintf(cmd.OutOrStdout(), "metricsctl %s\n", build)
 				return err
 			}
-			return printer.Print(v, output.Table{
-				Headers: []string{"version", "go", "platform"},
-				Rows:    [][]string{{v.Version, v.GoVersion, v.Platform}},
+			dirty := "false"
+			if build.Dirty {
+				dirty = "true"
+			}
+			return printer.Print(build, output.Table{
+				Headers: []string{"version", "commit", "date", "dirty", "go", "platform"},
+				Rows:    [][]string{{build.Version, build.Commit, build.Date, dirty, build.GoVersion, build.Platform}},
 			})
 		},
 	}

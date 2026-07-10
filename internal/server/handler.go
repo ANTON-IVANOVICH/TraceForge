@@ -60,7 +60,10 @@ func (h *Handler) SetAlerting(svc *alerting.Service) { h.alerting = svc }
 //
 // pprof is deliberately absent: it lives on its own listener, off by default.
 // See NewProfilingServer.
-func (h *Handler) Routes() http.Handler {
+// It returns the concrete *http.ServeMux rather than an http.Handler because the
+// metrics middleware needs to ask it which pattern a request matched, and only a
+// mux can answer that.
+func (h *Handler) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/metrics", h.ingest)
 	mux.HandleFunc("GET /api/v1/query", h.query)

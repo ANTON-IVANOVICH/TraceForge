@@ -1,0 +1,43 @@
+TraceForge {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+The server runs as a single-node StatefulSet ({{ .Values.server.replicas }} replica). It is NOT
+highly available — replicas>1 would give you independent stores with no
+replication. See values-prod.yaml before you touch server.replicas.
+
+Reach the API + dashboard (no LoadBalancer is created by default):
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "traceforge.server.fullname" . }} {{ .Values.server.http.port }}:{{ .Values.server.http.port }}
+
+Then, in another terminal:
+
+  # the embedded dashboard
+  open http://localhost:{{ .Values.server.http.port }}/{{ if not .Values.server.ui }}   # (UI disabled: server.ui=false — API only){{ end }}
+
+  # push a metric batch by hand
+  curl -sS http://localhost:{{ .Values.server.http.port }}/api/v1/metrics -X POST \
+    -H 'Content-Type: application/json' -d '{"metrics":[]}'
+
+The probes and Prometheus metrics live on the telemetry port, not the API port:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "traceforge.server.fullname" . }} {{ .Values.server.telemetry.port }}:{{ .Values.server.telemetry.port }}
+  curl -sS http://localhost:{{ .Values.server.telemetry.port }}/readyz    # 200 once ready, 503 while draining
+  curl -sS http://localhost:{{ .Values.server.telemetry.port }}/metrics   # Prometheus exposition
+
+{{- if .Values.agent.enabled }}
+
+The agent runs as a DaemonSet ({{ if .Values.agent.capture.enabled }}CAPTURE ENABLED — running as ROOT with NET_RAW/NET_ADMIN on every node{{ else }}one unprivileged pod per node{{ end }}):
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=agent -o wide
+{{- end }}
+
+{{- if .Values.server.auth.enabled }}
+
+Auth is ON. The server reads its HS256 secret from Secret "{{ .Values.server.auth.existingSecret }}"
+(key "{{ .Values.server.auth.hs256SecretKey }}") via secretKeyRef — the chart never templated it into args.
+{{- end }}
+
+{{- if not .Values.metrics.serviceMonitor.enabled }}
+
+To let a Prometheus Operator scrape this release, set metrics.serviceMonitor.enabled=true
+(requires the monitoring.coreos.com CRDs).
+{{- end }}

@@ -1,0 +1,46 @@
+# Development overlay: cheap, ephemeral, loud. Layer with:
+#   helm install tf deploy/charts/traceforge -f values-dev.yaml
+# It trades every production property for iteration speed, so DO NOT ship it.
+
+server:
+  # memory storage: nothing to persist, nothing to clean up, instant restarts.
+  # Cost: every restart loses all data — exactly what you want on a laptop.
+  storage: memory
+  logLevel: debug
+
+  # Tiny footprint so it fits alongside everything else on a kind/minikube node.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  # No LB in front, so no drain window is needed — fail fast on Ctrl-C.
+  shutdown:
+    delaySeconds: 0
+    timeoutSeconds: 5
+    graceBufferSeconds: 5
+
+  # A single throwaway node: don't let anti-affinity or a PDB get in the way.
+  podAntiAffinity:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+
+  # Smallest volume the cluster will grant; memory storage never touches it, but
+  # the volumeClaimTemplate still renders.
+  persistence:
+    size: 1Gi
+
+agent:
+  interval: 5s
+  logLevel: debug
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi

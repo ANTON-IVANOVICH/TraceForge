@@ -7,6 +7,7 @@
 package storage
 
 import (
+	"context"
 	"time"
 
 	"metrics-system/internal/model"
@@ -25,6 +26,19 @@ type Storage interface {
 	Query(q Query) ([]model.Metric, error)
 	// Stats reports the current size of the store.
 	Stats() Stats
+	// Ping reports whether the store can still do its job. It answers the
+	// readiness probe, so it carries two obligations the other methods do not.
+	//
+	// It must be cheap and it must not block behind a write: the probe runs every
+	// few seconds on every replica, and a Ping that waits for the store's lock
+	// turns one slow disk into a fleet-wide readiness failure — every replica
+	// leaves the load balancer at the same moment, which is an outage caused by
+	// the thing that was meant to detect one.
+	//
+	// It must report durability, not liveness. A backend that is accepting writes
+	// into memory while its fsync fails is the most dangerous state this system
+	// has: nothing is broken from the caller's side, and nothing is being kept.
+	Ping(ctx context.Context) error
 	// Close flushes and releases the backend's resources.
 	Close() error
 }

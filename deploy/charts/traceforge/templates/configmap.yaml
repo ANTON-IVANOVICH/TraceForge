@@ -1,0 +1,18 @@
+{{- if .Values.server.alerting.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "traceforge.server.fullname" . }}-alerting
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+# The alerting rules and receiver/routing config, mounted read-only into the
+# server. They live in a ConfigMap and NOT in args because they are multi-line
+# JSON documents, and never carry a secret — receiver credentials (SMTP/webhook
+# tokens) belong in a Secret the config references, never inline here.
+data:
+  rules.json: |-
+    {{- .Values.server.alerting.rules | nindent 4 }}
+  config.json: |-
+    {{- .Values.server.alerting.config | nindent 4 }}
+{{- end }}

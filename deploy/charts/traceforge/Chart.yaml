@@ -1,0 +1,31 @@
+apiVersion: v2
+name: traceforge
+description: >-
+  TraceForge — a Prometheus-like metrics system. A single-node server
+  (HTTP + gRPC ingest, embedded dashboard, optional alerting) and a
+  per-node collection agent, shipped with the security posture the
+  distroless images were built for.
+type: application
+
+# The chart's own version. Bump it on every change to the templates or the
+# default values — Helm uses it to decide whether `helm upgrade` has anything
+# to do. It is independent of the software version below.
+version: 0.11.0
+
+# The default image tag. Every image reference falls back to this, so an
+# upgrade of the software is a one-line change here rather than a hunt through
+# the values. It is pinned to a release tag on purpose: a chart that resolved
+# to "latest" would silently change what runs on the next node restart.
+appVersion: "0.11.0"
+
+home: https://github.com/ANTON-IVANOVICH/TraceForge
+sources:
+  - https://github.com/ANTON-IVANOVICH/TraceForge
+maintainers:
+  - name: TraceForge
+    url: https://github.com/ANTON-IVANOVICH/TraceForge
+keywords:
+  - metrics
+  - monitoring
+  - observability
+  - prometheus

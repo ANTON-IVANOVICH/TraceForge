@@ -4,8 +4,8 @@ A catalog of end-to-end flows the system supports, written as runnable recipes.
 This file is maintained alongside the staged roadmap: each milestone that adds a
 user-visible capability also adds or updates the relevant scenarios here.
 
-- **Covers up to:** v0.10.0 (CGo: libpcap binding, and the alternatives to it)
-- **Last updated:** 2026-07-09
+- **Covers up to:** v0.11.0 (deployment: containers, Kubernetes, probes, `/metrics`)
+- **Last updated:** 2026-07-10
 
 Conventions used below:
 
@@ -655,6 +655,16 @@ rules exist; `metricsctl --context <TAB>` lists the configured contexts.
 | `-network` with no target | neither `-network-device` nor `-network-file` | warning logged, agent runs on |
 | Invalid BPF filter | `-network-filter='not a filter'` | capture fails to open; collector disabled, agent runs on |
 | Cross-compiling with CGo | `make cross-cgo` | build error — the host toolchain cannot target another platform |
+| Readiness during a drain | `SIGTERM` with `-shutdown-delay=5s` | `/readyz` → `503 {"status":"not ready","checks":{"storage":"ok"}}` while the API still answers `200` |
+| Liveness during a drain | same | `/healthz` → `200` — a draining process is not a wedged one |
+| Readiness before boot finishes | probe before `pipeline.Start` | `/readyz` → `503 {"status":"starting"}`; `/startupz` → `503` |
+| TSDB fsync failing | full disk; `wal.Sync()` errors | `/readyz` → `503 ... "storage":"wal not syncing: ..."` — the replica leaves the load balancer |
+| Health check with no server | `server -health-check` against a closed port | exit `1`, `health check failed: ... connection refused` |
+| Unmatched request path | `GET /no/such/path` | counted as `route="other"` — an attacker cannot mint metric series |
+| WebSocket in the latency histogram | `GET /ws`, connection held open | request counted with `status="101"`; its duration is **not** observed |
+| Metrics on the API port | `GET :8080/metrics` | `404` — the scrape lives on the telemetry listener |
+| A metric with no cgroup | `docker run` with no `--memory` | `GOMEMLIMIT` left alone; `traceforge_go_memory_limit_bytes` reports the `MaxInt64` sentinel |
+| `GOMEMLIMIT` set by the operator | `GOMEMLIMIT=512MiB` | the process honours it and does not override it from the cgroup |
 
 ---
 
@@ -752,6 +762,97 @@ The bugs this stage's fuzzers and benchmarks turned up — a non-injective serie
 key, an alert-fingerprint collision, an unbounded WAL allocation, a chunk
 overflow, a gRPC-only NaN, an unbounded rate-limiter map — are in the failure
 table above and detailed in `CHANGELOG.md`.
+
+---
+
+## 12. Deployment
+
+### 12.1 Run it in containers
+
+```bash
+make docker-smoke                 # build the image, run it, ask it what it is
+make compose-up                   # server + agent + prometheus + grafana
+curl -s localhost:9091/readyz     # {"status":"ok","checks":{"storage":"ok"}}
+curl -s localhost:9091/metrics    # the Prometheus text exposition format
+make compose-down
+```
+
+The image has no shell. `docker exec traceforge-server-1 sh` fails; the
+`HEALTHCHECK` works anyway, because it runs the server binary against its own
+`/readyz`:
+
+```bash
+docker exec traceforge-server-1 /usr/local/bin/server -health-check; echo $?   # 0
+```
+
+### 12.2 Watch it respect its cgroup
+
+```bash
+docker run --rm --memory=256m --cpus=1.5 traceforge/server:dev -storage=memory -ui=false
+```
+
+```json
+{"msg":"GOMEMLIMIT derived from cgroup memory limit","cgroup_limit_bytes":268435456,"ratio":0.9,"gomemlimit_bytes":241591910}
+{"msg":"server started","http_addr":"[::]:8080","storage":"memory","gomaxprocs":2,...}
+```
+
+`gomaxprocs: 2` is the Go runtime's own answer to a 1.5-CPU quota. Nothing in this
+project set it — and nothing should, because setting it freezes the runtime's
+periodic re-derivation.
+
+### 12.3 Deploy to Kubernetes
+
+```bash
+helm install traceforge deploy/charts/traceforge -n traceforge --create-namespace \
+  -f deploy/charts/traceforge/values-prod.yaml
+
+# with packet capture (root, CAP_NET_RAW, the agent-pcap image):
+helm install traceforge deploy/charts/traceforge --set agent.capture.enabled=true
+
+# without helm:
+kubectl apply -f deploy/k8s/traceforge.yaml
+```
+
+### 12.4 Watch a rolling restart not serve 502s
+
+```bash
+kubectl -n traceforge exec deploy/traceforge-server -- /usr/local/bin/server -health-check
+kubectl -n traceforge delete pod traceforge-server-0
+# during the drain, from another shell:
+#   /readyz  -> 503 {"status":"not ready","checks":{"storage":"ok"}}
+#   /healthz -> 200
+#   the API  -> 200, until -shutdown-delay elapses
+```
+
+The order matters and is the point: readiness fails first so the endpoint is
+withdrawn, the process keeps serving for `-shutdown-delay` while that propagates,
+and only then does the listener close.
+
+### 12.5 Check the deployment artefacts before a cluster does
+
+```bash
+make deploy-check    # helm lint, kubeconform, manifest drift, then:
+go test ./test/deploy/...
+#   TestManifestFlagsExist              every -flag in a manifest exists in the binary
+#   TestDashboardsReferenceRealMetrics   every metric a panel plots is exported
+#   TestEveryAlertHasARunbookThatExists  every alert links a runbook that exists
+#   TestRenderedManifestsAreHardened     nonroot, read-only rootfs, drop ALL, probes, no :latest
+#   TestShutdownBudgetsAreConsistent     delay < timeout < terminationGracePeriodSeconds
+```
+
+### 12.6 Release
+
+```bash
+make release-check      # goreleaser check
+make release-snapshot   # build every artefact, publish nothing
+make vuln               # govulncheck, call-graph aware
+```
+
+The release workflow is `workflow_dispatch`-only, with a `push` input that
+defaults to false. Its tag trigger is committed but commented out: a tag-triggered
+release pushes images to a registry and writes an append-only entry into Sigstore's
+public transparency log, and nobody typing `git push --tags` while reading along
+has agreed to either.
 
 ---
 

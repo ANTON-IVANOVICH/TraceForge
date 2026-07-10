@@ -1,0 +1,39 @@
+# The build context is uploaded to the daemon on every build. Keeping it small is
+# not tidiness — it is the difference between a one-second and a ten-second
+# no-op rebuild, and it stops a stray `data/` directory from ending up in a layer.
+#
+# `.git` is excluded, and that is a decision rather than an oversight. The Go
+# toolchain can stamp vcs.revision and vcs.modified into a binary built inside a
+# work tree (internal/buildinfo reads them), but only if a `git` binary is on the
+# builder's PATH — and golang:alpine ships without one. With `-buildvcs=auto`,
+# the default, the toolchain then skips the stamp *silently*, so keeping .git in
+# the context would upload tens of megabytes to buy nothing. The Dockerfile passes
+# -buildvcs=false to say so out loud, and the version comes from --build-arg,
+# which the Makefile, the CI workflow and GoReleaser all supply.
+
+.git/
+/bin/
+/dist/
+/data/
+/.cache/
+/.bench/
+/.prof/
+
+# Build outputs and local artefacts.
+/server
+/agent
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Rendered manifests and charts are inputs to Kubernetes, never to a Go build.
+/deploy/k8s/
+/deploy/charts/
+
+# Documentation. A README change should not invalidate the builder layer.
+/docs/
+**/*.md
+
+.DS_Store
+.github/

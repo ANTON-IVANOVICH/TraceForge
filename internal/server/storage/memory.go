@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"sync"
 
@@ -94,6 +95,14 @@ func (s *MemoryStorage) Stats() Stats {
 	}
 	return Stats{Series: len(s.series), Points: points}
 }
+
+// Ping always succeeds: there is no disk to fail and no connection to drop. It
+// honours ctx only so that a caller who cancels mid-probe gets the cancellation
+// it asked for rather than a stale success.
+//
+// It deliberately does not take s.mu. A readiness probe that queues behind a
+// batch write reports "not ready" precisely when the server is busiest.
+func (s *MemoryStorage) Ping(ctx context.Context) error { return ctx.Err() }
 
 // Close is a no-op for the in-memory store.
 func (s *MemoryStorage) Close() error { return nil }

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"metrics-system/internal/model"
@@ -44,6 +45,19 @@ type TSDB struct {
 	head      *head
 	chunks    []*chunk.Reader
 	nextChunk int
+
+	// durability is the last error from the background fsync, or nil. It exists
+	// because of the worst state this database can reach: the WAL's Write returns
+	// nil (the bytes are in the kernel's page cache), the head serves them back on
+	// query, and the fsync that would have made them survive a power cut has been
+	// failing for an hour on a full disk. Nothing in the write path notices. The
+	// only place that learns of it is syncLoop, which used to log the error and
+	// drop it.
+	//
+	// Ping reads this, so a replica whose disk stopped accepting fsyncs fails its
+	// readiness probe and leaves the load balancer instead of quietly accepting
+	// writes it cannot keep.
+	durability atomic.Pointer[error]
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -304,11 +318,43 @@ func (db *TSDB) syncLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := db.wal.Sync(); err != nil {
-				db.logger.Error("wal sync failed", "error", err)
-			}
+			db.recordSync(db.wal.Sync())
 		}
 	}
+}
+
+// recordSync publishes the outcome of the last fsync so Ping can report it.
+// A success clears a previous failure: a disk that filled up and was cleaned up
+// should bring the replica back without a restart.
+func (db *TSDB) recordSync(err error) {
+	if err != nil {
+		db.logger.Error("wal sync failed", "error", err)
+		db.durability.Store(&err)
+		return
+	}
+	db.durability.Store(nil)
+}
+
+// Ping reports whether writes are still reaching stable storage.
+//
+// It reads a value the background fsync publishes rather than fsyncing itself.
+// Calling Sync here would mean the readiness probe issues an fsync every few
+// seconds — turning a health check into write amplification — and would block
+// behind the very disk it is trying to ask about, which is the one thing a probe
+// must never do.
+//
+// Note what this does not check: that the head is consistent, or that a query
+// would succeed. Those failures kill the process, and a dead process needs no
+// probe. What can fail silently, indefinitely, and only matters at the next power
+// cut is the fsync.
+func (db *TSDB) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if errp := db.durability.Load(); errp != nil {
+		return fmt.Errorf("wal not syncing: %w", *errp)
+	}
+	return nil
 }
 
 func (db *TSDB) flushLoop(ctx context.Context) {

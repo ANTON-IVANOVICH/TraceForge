@@ -203,7 +203,7 @@ func (p *process) crash() {
 // Binding ":0" and reading the port back is what lets every test here run its
 // own server concurrently, with no port registry and no flaky "address already
 // in use" on a busy CI machine.
-func waitForAddrs(t *testing.T, p *process) (httpAddr, grpcAddr string) {
+func waitForAddrs(t *testing.T, p *process) (httpAddr, grpcAddr, telAddr string) {
 	t.Helper()
 
 	testutil.Eventually(t, 30*time.Second, 20*time.Millisecond, func() bool {
@@ -217,6 +217,7 @@ func waitForAddrs(t *testing.T, p *process) (httpAddr, grpcAddr string) {
 			}
 			httpAddr, _ = rec["http_addr"].(string)
 			grpcAddr, _ = rec["grpc_addr"].(string)
+			telAddr, _ = rec["telemetry_addr"].(string)
 			return httpAddr != ""
 		}
 		return false
@@ -233,17 +234,30 @@ func waitForAddrs(t *testing.T, p *process) (httpAddr, grpcAddr string) {
 		return resp.StatusCode == http.StatusOK
 	}, "server at %s should answer /healthz", httpAddr)
 
-	return httpAddr, grpcAddr
+	return httpAddr, grpcAddr, telAddr
 }
 
 // startServer runs the server on kernel-assigned ports with the given extra
 // flags and returns it along with its addresses.
+//
+// The telemetry listener is bound to port 0 like the others. Left at its default
+// of :9091 it would be the one fixed port in the suite, and the second test to
+// run in parallel — or the first on a developer's machine that already has
+// something on 9091 — would fail to start for a reason that has nothing to do
+// with what it was testing.
 func startServer(t *testing.T, extra ...string) (p *process, httpAddr, grpcAddr string) {
 	t.Helper()
-	args := append([]string{"-addr=127.0.0.1:0", "-grpc-addr=127.0.0.1:0"}, extra...)
-	p = start(t, "server", binaries.server, args...)
-	httpAddr, grpcAddr = waitForAddrs(t, p)
+	p, httpAddr, grpcAddr, _ = startServerWithTelemetry(t, extra...)
 	return p, httpAddr, grpcAddr
+}
+
+// startServerWithTelemetry is startServer for the tests that need the admin port.
+func startServerWithTelemetry(t *testing.T, extra ...string) (p *process, httpAddr, grpcAddr, telAddr string) {
+	t.Helper()
+	args := append([]string{"-addr=127.0.0.1:0", "-grpc-addr=127.0.0.1:0", "-telemetry-addr=127.0.0.1:0"}, extra...)
+	p = start(t, "server", binaries.server, args...)
+	httpAddr, grpcAddr, telAddr = waitForAddrs(t, p)
+	return p, httpAddr, grpcAddr, telAddr
 }
 
 // queryMetrics calls the read API. It returns an empty slice rather than an

@@ -1,0 +1,322 @@
+# TraceForge default values.
+#
+# Every key below carries a note on what it costs to change it — not what it is
+# (the name says that), but what breaks, slows down or opens up if you touch it.
+# The defaults are the safe, single-node, locked-down posture; the deltas that
+# make a deployment production-real live in values-prod.yaml.
+
+# nameOverride / fullnameOverride: rename the objects this chart creates.
+# Cost: changing either after install renames StatefulSet/Service objects, which
+# Helm does by delete+create — the server's PVC is retained but the pod churns.
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # create: mint a dedicated ServiceAccount for the pods.
+  # Cost of false: pods fall back to the namespace "default" SA, which usually
+  # carries broader RBAC than these pods should have.
+  create: true
+  name: ""
+  annotations: {}
+  # automountServiceAccountToken: neither the server nor the agent talks to the
+  # API server, so the token is dead weight and a credential an attacker would
+  # love. Cost of true: a mounted token that nothing uses.
+  automountServiceAccountToken: false
+
+# -----------------------------------------------------------------------------
+# Server — the single-node ingest + query + dashboard process. Runs as a
+# StatefulSet because its identity and its data volume are stable and singular.
+# -----------------------------------------------------------------------------
+server:
+  # replicas: KEEP THIS AT 1 unless you know the clustering stage has shipped.
+  # Cost of >1: N servers each with their OWN independent store and NO
+  # replication between them — agents would shard across them at random and every
+  # query would see a fraction of the data. This is data loss dressed up as
+  # scale-out. See values-prod.yaml for the full explanation.
+  replicas: 1
+
+  image:
+    repository: traceforge/server
+    # tag "" defaults to .Chart.AppVersion. Cost of setting it: you pin to a
+    # specific build; cost of "latest" (rejected by a test): non-reproducible
+    # rollouts.
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  # storage backend: memory | bolt | tsdb.
+  # Cost: "memory" loses everything on restart; "bolt"/"tsdb" need the PVC below.
+  # tsdb is the production choice — it is what the volumeClaimTemplate exists for.
+  storage: tsdb
+
+  # dataDir: where bolt/tsdb write. This is the mountPath of the data PVC.
+  # Cost of change: must stay a writable, persistent path; with a read-only root
+  # filesystem it MUST be a mounted volume, not a bare directory.
+  dataDir: /data
+
+  logLevel: info
+
+  # Pipeline sizing. Cost of raising: more memory and goroutines; the worker
+  # counts default (in the binary) to GOMAXPROCS, so leaving these empty lets the
+  # process size itself to its CPU quota — usually the right call.
+  ingestBuffer: 1000
+  validateWorkers: 0   # 0 => omit the flag => binary uses GOMAXPROCS
+  enrichWorkers: 0
+  storeWorkers: 1
+
+  # Per-agent rate limit. Cost of lowering: legitimate bursts get 429'd; cost of
+  # raising: a misbehaving agent can push the pipeline into drops.
+  rateLimit:
+    rps: 100
+    burst: 200
+
+  # HTTP API + dashboard.
+  http:
+    port: 8080
+  # gRPC ingest. enabled=false passes -grpc-addr="" and disables the listener.
+  # Cost of disabling: agents configured for grpc transport cannot connect.
+  grpc:
+    enabled: true
+    port: 9090
+  # Telemetry: the three probes and /metrics. This is the port every probe and
+  # the ServiceMonitor target. Cost of moving it: update networkPolicy + probes.
+  telemetry:
+    port: 9091
+
+  # Embedded live dashboard at /. Cost of false: no UI; the API still serves.
+  ui: true
+
+  # Graceful shutdown. The two numbers have a hard ordering the templates enforce
+  # and terminationGracePeriodSeconds is derived from them — see the StatefulSet.
+  shutdown:
+    # delaySeconds: after SIGTERM, fail readiness and wait this long BEFORE
+    # closing listeners, so the load balancer stops routing first. 0 is fine for
+    # a bare cluster; behind an ingress/LB set ~5s (values-prod does).
+    # Cost: too low => 502s on rollout; too high => slower deploys.
+    delaySeconds: 5
+    # timeoutSeconds: hard deadline for the whole drain. MUST be strictly greater
+    # than delaySeconds (a render-time check enforces it) and strictly less than
+    # the pod's grace period (which is derived as timeout + graceBufferSeconds).
+    timeoutSeconds: 25
+    # graceBufferSeconds: head-room added on top of timeoutSeconds to get
+    # terminationGracePeriodSeconds, so the kubelet's SIGKILL always lands AFTER
+    # the process's own deadline — the process gets to log which step hung.
+    graceBufferSeconds: 10
+
+  # memoryLimitRatio: fraction of the cgroup memory limit handed to GOMEMLIMIT.
+  # Cost of raising toward 1.0: less GC head-room => higher OOM-kill risk under
+  # spikes. The binary reads the cgroup itself; do not also set GOMEMLIMIT.
+  memoryLimitRatio: 0.9
+
+  # pprof: off by default and loopback-only when on. Cost of exposing it on a
+  # routable address: anyone who can reach it can read your heap. Leave "".
+  pprofAddr: ""
+
+  # Authentication. Secrets are NEVER templated into args or a ConfigMap; they
+  # come from an existing Secret via secretKeyRef. If enabled with no
+  # existingSecret, the render fails loudly rather than shipping an open server.
+  auth:
+    enabled: false
+    # existingSecret: name of a pre-created Secret in this namespace.
+    existingSecret: ""
+    # hs256SecretKey: key within that Secret holding the HS256 JWT shared secret.
+    # Wired to the JWT_HS256_SECRET env var via secretKeyRef.
+    hs256SecretKey: "jwt-hs256-secret"
+    # Non-secret JWT validation knobs — safe to pass as plain args.
+    jwksUrl: ""
+    issuer: ""
+    audience: ""
+
+  # Alerting. Cost of enabling: the server evaluates rules against storage on a
+  # loop (CPU + read load) and exports traceforge_alerting_active_alerts. The
+  # rules and receiver config are shipped in a ConfigMap and mounted read-only.
+  alerting:
+    enabled: false
+    lookback: 5m
+    buffer: 1024
+    # rules / config: JSON documents rendered verbatim into the ConfigMap. Cost
+    # of a malformed document: the server fails to start (fail-fast, by design).
+    rules: |
+      []
+    config: |
+      {}
+
+  # Persistent volume for bolt/tsdb, materialised as the StatefulSet's
+  # volumeClaimTemplate. Cost of a small size: tsdb runs out of room and writes
+  # start failing (the "failed" pipeline counter climbs). storageClassName ""
+  # uses the cluster default; set it to pin fast SSD.
+  persistence:
+    size: 20Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+
+  # resources: BOTH requests and limits, cpu and memory, are mandatory — a test
+  # rejects any container missing either. Requests size the scheduler's choice
+  # and set the CPU quota the runtime reads for GOMAXPROCS; limits are the OOM
+  # ceiling GOMEMLIMIT is derived from. Cost of tight limits: OOM kills; cost of
+  # loose requests: wasted reservation and an oversized GOMAXPROCS.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  # Scheduling passthrough. All optional; empty means "no constraint".
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # podAntiAffinity (preferred) keeps replicas off the same node when replicas>1.
+  # Preferred, not required, so a single-node test cluster still schedules.
+  podAntiAffinity:
+    enabled: true
+  # topologySpreadConstraints: spread pods across zones/nodes. Empty => none.
+  topologySpreadConstraints: []
+
+  # PodDisruptionBudget. Cost with a single replica: minAvailable:1 would BLOCK
+  # node drains, so the default uses maxUnavailable:1 to let voluntary
+  # disruptions proceed. Disable if you want drains to always wait.
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+
+  service:
+    # ClusterIP for the API; a separate headless Service gives the StatefulSet
+    # its stable DNS. Cost of LoadBalancer/NodePort here: you expose ingest to
+    # the world without the auth above — don't, unless auth.enabled is true.
+    type: ClusterIP
+    annotations: {}
+
+  # extraArgs / extraEnv: escape hatches for flags this chart does not model.
+  # Cost: unvalidated — a typo'd flag crashes the server on start.
+  extraArgs: []
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# Agent — one collector pod per node, as a DaemonSet.
+# -----------------------------------------------------------------------------
+agent:
+  # enabled: ship the DaemonSet at all. Cost of false: no per-node metrics.
+  enabled: true
+
+  image:
+    repository: traceforge/agent
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  # transport: http | grpc. Cost of grpc: needs server.grpc.enabled.
+  transport: http
+  # interval: collection period. Cost of shortening: more load on both ends.
+  interval: 15s
+  logLevel: info
+
+  telemetry:
+    port: 9101
+  memoryLimitRatio: 0.9
+
+  # terminationGracePeriodSeconds: how long the kubelet waits after SIGTERM before
+  # SIGKILL. The agent has no user traffic to drain, but with capture enabled it
+  # holds a libpcap handle a goroutine may still be inside. Cost of shortening: a
+  # SIGKILL that frees a C pointer out from under Go.
+  terminationGracePeriodSeconds: 10
+
+  # http retry/backoff for the ingest calls. Cost of raising retries: a slow
+  # server backs the agent up rather than shedding.
+  http:
+    timeout: 10s
+    retries: 2
+    backoff: 200ms
+
+  # Auth to the server. Like the server, secrets come from an existing Secret;
+  # the value here is only the Secret NAME and the keys within it.
+  auth:
+    # existingSecret holding the agent's credentials, or "" for none.
+    existingSecret: ""
+    # apiKeyKey / bearerKey: keys inside that Secret. Wired via secretKeyRef to
+    # AGENT_API_KEY / AGENT_AUTH_TOKEN.
+    apiKeyKey: "api-key"
+    bearerKey: "auth-token"
+
+  # Packet capture. THE ONE PRIVILEGED EXCEPTION IN THIS CHART.
+  # Cost of enabling: the DaemonSet switches to the traceforge/agent-pcap image,
+  # runs as ROOT (uid 0, runAsNonRoot:false) and is granted NET_RAW + NET_ADMIN —
+  # because opening a raw socket needs CAP_NET_RAW, and a runtime-granted
+  # capability only lands in the permitted set of a root process; distroless has
+  # no file/ambient capabilities to hand it to a non-root one. Leave this off
+  # unless you actually need network metrics.
+  capture:
+    enabled: false
+    image:
+      repository: traceforge/agent-pcap
+      tag: ""
+      pullPolicy: IfNotPresent
+    device: "eth0"
+    file: ""
+    filter: "ip or ip6"
+    snaplen: 128
+
+  # resources: mandatory requests+limits, kept lean because this runs on EVERY
+  # node and every megabyte is multiplied by the node count.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  # The DaemonSet tolerates ALL taints (operator: Exists) so it also lands on
+  # control-plane and specially-tainted nodes — a node with no agent is a node
+  # whose outage you cannot see. Cost: the agent runs literally everywhere.
+  tolerations:
+    - operator: Exists
+  nodeSelector: {}
+  affinity: {}
+
+  extraArgs: []
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# Cluster-wide toggles.
+# -----------------------------------------------------------------------------
+
+# NetworkPolicy: default-deny ingress to the server, then re-open exactly the
+# paths that must exist. Cost of enabling on a cluster whose CNI ignores
+# NetworkPolicy: nothing changes (silently no-op). Cost on an enforcing CNI with
+# these values wrong: the agents cannot reach the server.
+networkPolicy:
+  enabled: false
+  # The namespace Prometheus lives in; only it may reach the telemetry port.
+  monitoringNamespace: monitoring
+
+  # nodeCIDRs: the addresses a hostNetwork agent's ingest arrives from.
+  #
+  # Required when agent.capture.enabled is set, because capture needs hostNetwork
+  # (a raw socket in the pod's own network namespace sees a veth and nothing else),
+  # and a hostNetwork pod's packets carry the node's IP and none of the pod's
+  # labels — so no podSelector can match them. The chart refuses to render rather
+  # than let ingest fail silently.
+  #
+  # Cost of setting it: every node in these ranges may reach the ingest ports.
+  # Narrow them if the nodes running agents are a known subset.
+  nodeCIDRs: []
+
+metrics:
+  serviceMonitor:
+    # Requires the Prometheus Operator CRDs. Cost of true without them installed:
+    # the object fails to apply (its CRD is missing).
+    enabled: false
+    # interval / scrapeTimeout: scrape cadence for the telemetry endpoint.
+    interval: 30s
+    scrapeTimeout: 10s
+    # Extra labels so a Prometheus Operator with a label selector adopts it.
+    labels: {}
+
+# Image pull secrets, applied to every pod. Cost: none if your images are public.
+imagePullSecrets: []
+
+# podAnnotations / podLabels: merged onto every pod on top of the scrape
+# annotations the chart already sets. Cost: purely additive.
+podAnnotations: {}
+podLabels: {}

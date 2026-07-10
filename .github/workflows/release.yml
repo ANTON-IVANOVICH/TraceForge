@@ -1,0 +1,284 @@
+name: Release
+
+# The trigger is commented out on purpose, and this is the one place in the repo
+# where that is a load-bearing decision rather than caution.
+#
+# A tag-triggered release publishes: it pushes container images to this account's
+# GHCR, it creates a GitHub Release, and it writes a signature into Sigstore's
+# public transparency log — which is append-only, so the entry cannot be removed
+# afterwards. Those are consequences of pushing a tag, and nobody pushing
+# `v0.11.0` while following along with this repository has consented to them.
+#
+# Run it deliberately, from the Actions tab, with `push: false` the first time to
+# see what it would do. Uncomment the tag trigger when this lives somewhere that
+# has a registry to publish to and someone reading the results.
+on:
+  # push:
+  #   tags:
+  #     - "v*"          # re-enable to release on `git push --tags`
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist, e.g. v0.11.0)"
+        required: true
+        type: string
+      push:
+        description: "Push images and create the GitHub Release. Leave off for a dry run."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+  REGISTRY: ghcr.io
+
+jobs:
+  # Nothing is published before the tests that would have caught the reason not to.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: unit tests
+        run: go test -race -count=1 ./...
+
+      - name: no reachable vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      # A release whose version does not match its tag is a release nobody can
+      # roll back to, because the binary and the tag disagree about what it is.
+      - name: the tag is a semantic version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::$TAG is not a vMAJOR.MINOR.PATCH tag"; exit 1 ;;
+          esac
+
+  # Binaries, archives, checksums, SBOMs, and a keyless Sigstore signature over the
+  # checksum file. See .goreleaser.yaml.
+  goreleaser:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # the OIDC token cosign signs with
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0 # goreleaser reads the whole history for the changelog
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: sigstore/cosign-installer@v3
+      - uses: anchore/sbom-action/download-syft@v0
+
+      - name: goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          # A dry run still builds everything, generates the SBOMs and signs
+          # nothing. It is the only honest way to test a release pipeline.
+          args: >-
+            ${{ inputs.push
+              && 'release --clean'
+              || 'release --snapshot --clean --skip=sign' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-artifacts
+          path: dist/*
+          retention-days: 7
+
+  # Images are built here rather than by GoReleaser, because the packet-capture
+  # agent links against libpcap and must be compiled on the architecture it will
+  # run on. buildx does that with QEMU; a cross-compiling Go build cannot.
+  images:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: server
+            image: traceforge-server
+            platforms: linux/amd64,linux/arm64
+          - target: agent
+            image: traceforge-agent
+            platforms: linux/amd64,linux/arm64
+          - target: metricsctl
+            image: metricsctl
+            platforms: linux/amd64,linux/arm64
+          # Emulated, and therefore slow. amd64 only: an arm64 build under QEMU
+          # takes long enough that it is cheaper to add a native arm64 runner than
+          # to wait, and nobody has asked for one yet.
+          - target: agent-pcap
+            image: traceforge-agent-pcap
+            platforms: linux/amd64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+
+      # An OCI repository name must be lowercase; a GitHub owner login need not be.
+      # docker/metadata-action lowercases what it is given, which is why the build
+      # and push below work — and why every reference assembled by hand from
+      # `github.repository_owner` does not. cosign and Trivy both take such a
+      # reference, so the lowercased name is computed once, here, and used by both.
+      #
+      # The build date comes from the tagged commit, not from `now` and not from
+      # `github.event.repository.updated_at` (which changes when somebody edits the
+      # repository description). The archives already stamp `.CommitDate`; an image
+      # rebuilt from the same tag must produce the same bytes as the archive did.
+      #
+      # The inputs are passed through `env:` rather than interpolated into the
+      # script. A `${{ }}` inside `run:` is textual substitution before the shell
+      # ever sees it, which makes any workflow input a shell-injection vector.
+      - name: normalise the image reference and the build date
+        id: ref
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ matrix.image }}
+          REGISTRY: ${{ env.REGISTRY }}
+        run: |
+          set -euo pipefail
+          echo "image=${REGISTRY}/${OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          # HEAD, not the tag name: actions/checkout has already put the tagged
+          # commit there, and with a shallow fetch the tag ref itself may be absent.
+          echo "build_date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: log in to GHCR
+        if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` must not follow a pre-release. Someone who pulls `:latest` is
+      # asking for the newest thing that was meant for them, and v0.12.0-rc.1 was
+      # not. The metadata action's semver patterns encode that rule; writing the
+      # tag list by hand is how `latest` ends up pointing at a release candidate.
+      #
+      # Note that `{{version}}` strips the leading `v`: the tag v0.11.0 becomes the
+      # image tag 0.11.0. Nothing downstream may assume otherwise.
+      - name: compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ref.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
+            type=raw,value=latest,enable=${{ !contains(inputs.tag, '-') }}
+
+      - name: build ${{ matrix.target }}
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platforms }}
+          push: ${{ inputs.push }}
+          # A multi-platform image cannot be `--load`ed into the local daemon, so a
+          # dry run builds it and throws it away. What that proves is that it
+          # compiles and links on every architecture, which is the failure worth
+          # catching before a tag exists.
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ inputs.tag }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.ref.outputs.build_date }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+
+      # Keyless: the identity is this workflow, proved by the OIDC token, and the
+      # signature is recorded in Rekor. There is no key to leak.
+      #
+      # Signed by digest, not by tag: a tag is a mutable pointer, and a signature
+      # over one says nothing about the bytes it points at tomorrow. Verify with:
+      #
+      #   cosign verify ghcr.io/<owner>/traceforge-server:0.11.0 \
+      #     --certificate-identity-regexp 'https://github.com/<owner>/TraceForge/.*' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: sign the image
+        if: inputs.push
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  # Trivy scans the image, not the source: govulncheck already covered the Go code
+  # with a call graph. What is left is the base image's own packages, which for
+  # distroless is close to nothing — and "close to nothing" is a claim worth
+  # re-checking on every release rather than assuming.
+  scan:
+    needs: images
+    if: inputs.push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      # The image that was actually pushed, spelled the way it was actually
+      # pushed: the repository name lowercased (an OCI reference may not carry an
+      # uppercase letter, whatever a GitHub owner login may), and the tag with its
+      # leading `v` stripped, because that is what `{{version}}` produced. Building
+      # this reference by hand from `inputs.tag` gives `:v0.11.0`, which no push
+      # ever created — Trivy would fail to pull it, on every release.
+      - name: the image reference, as pushed
+        id: ref
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ inputs.tag }}
+          REGISTRY: ${{ env.REGISTRY }}
+        run: |
+          set -euo pipefail
+          echo "image=${REGISTRY}/${OWNER,,}/traceforge-server:${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif

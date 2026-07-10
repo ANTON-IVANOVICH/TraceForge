@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"metrics-system/internal/buildinfo"
 )
 
 // -update rewrites the golden files. Run `go test ./internal/cli -update` after
@@ -71,7 +73,7 @@ func run(t *testing.T, server string, stdin string, args ...string) (stdout, std
 
 	var out, errBuf bytes.Buffer
 	opts := &Options{Stdout: &out, Stderr: &errBuf, Stdin: strings.NewReader(stdin)}
-	root := NewRootCmd("v-test", opts)
+	root := NewRootCmd(testBuild("v-test"), opts)
 	root.SetOut(&out)
 	root.SetErr(&errBuf)
 	root.SetArgs(append([]string{"--config", cfgPath, "--no-color"}, args...))
@@ -433,7 +435,7 @@ func TestCredentialFlagReplacesTheContextCredential(t *testing.T) {
 	}
 
 	var out, errBuf bytes.Buffer
-	root := NewRootCmd("v-test", &Options{Stdout: &out, Stderr: &errBuf, Stdin: strings.NewReader("")})
+	root := NewRootCmd(testBuild("v-test"), &Options{Stdout: &out, Stderr: &errBuf, Stdin: strings.NewReader("")})
 	root.SetOut(&out)
 	root.SetErr(&errBuf)
 	root.SetArgs([]string{"--config", cfgPath, "--no-color", "--token", "STAGETOKEN", "rules", "list"})
@@ -813,7 +815,7 @@ func TestConfigContexts(t *testing.T) {
 	exec := func(args ...string) (string, error) {
 		var out, errBuf bytes.Buffer
 		opts := &Options{Stdout: &out, Stderr: &errBuf, Stdin: strings.NewReader("")}
-		root := NewRootCmd("v-test", opts)
+		root := NewRootCmd(testBuild("v-test"), opts)
 		root.SetOut(&out)
 		root.SetErr(&errBuf)
 		root.SetArgs(append([]string{"--config", cfgPath, "--no-color"}, args...))
@@ -882,13 +884,26 @@ func TestConfigContexts(t *testing.T) {
 	}
 }
 
+// testBuild is the build identity the CLI tests run against. Assembling it here
+// rather than calling buildinfo.Get() keeps the tests independent of whether the
+// test binary was linked with ldflags or built inside a git tree.
+func testBuild(version string) buildinfo.Info {
+	return buildinfo.Info{
+		Version:   version,
+		Commit:    "0123456789ab",
+		Date:      "2026-07-10T00:00:00Z",
+		GoVersion: "go1.26.2",
+		Platform:  "linux/amd64",
+	}
+}
+
 // version and completion must work with no config and no reachable server.
 func TestVersionAndCompletionNeedNoServer(t *testing.T) {
 	t.Setenv("METRICSCTL_CONFIG", filepath.Join(t.TempDir(), "absent.yaml"))
 
 	exec := func(args ...string) (string, error) {
 		var out bytes.Buffer
-		root := NewRootCmd("v1.2.3", &Options{Stdout: &out, Stderr: &out, Stdin: strings.NewReader("")})
+		root := NewRootCmd(testBuild("v1.2.3"), &Options{Stdout: &out, Stderr: &out, Stdin: strings.NewReader("")})
 		root.SetOut(&out)
 		root.SetErr(&out)
 		root.SetArgs(args)

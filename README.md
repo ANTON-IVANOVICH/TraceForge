@@ -103,9 +103,17 @@ make run-agent
 
 - `POST /api/v1/metrics` — ingest a batch → `202 Accepted` (or `503` when overloaded)
 - `GET  /api/v1/query` — query stored metrics (see parameters below)
-- `GET  /debug/stats` — pipeline + storage self-metrics (JSON)
+- `GET  /debug/stats` — pipeline + storage self-metrics (JSON, admin)
 - `GET  /healthz` — liveness check
-- `GET  /debug/pprof/` — runtime profiling (`net/http/pprof`)
+
+On the telemetry listener (`-telemetry-addr`, default `:9091`), never on the API port:
+
+- `GET /healthz`, `GET /readyz`, `GET /startupz` — the Kubernetes probes
+- `GET /metrics` — Prometheus text exposition
+
+`net/http/pprof` has a third listener of its own (`-pprof-addr`, off by default):
+`/debug/pprof/cmdline` prints this process's argv, and argv is where
+`-jwt-hs256-secret` lives.
 
 With `-alerting` (all tenant-scoped; reads need `query`, writes need `admin`):
 
@@ -140,6 +148,10 @@ curl -s 'http://localhost:8080/api/v1/query?name=memory_used_percent&host=my-hos
 # Pipeline/storage stats and health
 curl -s http://localhost:8080/debug/stats | jq
 curl -i http://localhost:8080/healthz
+
+# The probes and the scrape, on the telemetry port
+curl -s http://localhost:9091/readyz | jq
+curl -s http://localhost:9091/metrics | head
 ```
 
 ## gRPC transport
@@ -452,8 +464,8 @@ Priority: defaults → environment variables → flags.
 - `-storage` / `STORAGE` — backend: `memory` | `bolt` | `tsdb` (default `memory`)
 - `-data-dir` / `DATA_DIR` — data directory for the `bolt`/`tsdb` backends (default `./data`)
 - `-ingest-buffer` / `INGEST_BUFFER` — ingest channel buffer / backpressure (default `1000`)
-- `-validate-workers` / `VALIDATE_WORKERS` — validate stage workers (default `NumCPU`)
-- `-enrich-workers` / `ENRICH_WORKERS` — enrich stage workers (default `NumCPU`)
+- `-validate-workers` / `VALIDATE_WORKERS` — validate stage workers (default `GOMAXPROCS`, which respects the cgroup CPU quota; `NumCPU` does not)
+- `-enrich-workers` / `ENRICH_WORKERS` — enrich stage workers (default `GOMAXPROCS`)
 - `-store-workers` / `STORE_WORKERS` — store stage workers (default `1`)
 - `-rate-limit-rps` / `RATE_LIMIT_RPS` — per-agent requests/second (default `100`)
 - `-rate-limit-burst` / `RATE_LIMIT_BURST` — per-agent burst (default `200`)
@@ -468,6 +480,12 @@ Priority: defaults → environment variables → flags.
 - `-alert-config` / `ALERT_CONFIG_FILE` — receivers/routing/inhibition JSON file
 - `-alert-lookback` / `ALERT_LOOKBACK` — how far back an instant selector reaches (default `5m`)
 - `-alert-buffer` / `ALERT_BUFFER` — evaluator→notifier channel buffer (default `1024`)
+- `-telemetry-addr` / `TELEMETRY_ADDR` — `/healthz`, `/readyz`, `/startupz`, `/metrics` (default `:9091`; empty disables)
+- `-shutdown-delay` / `SHUTDOWN_DELAY` — on SIGTERM, fail readiness and keep serving this long before closing listeners (default `0`; use `~5s` behind a load balancer)
+- `-shutdown-timeout` / `SHUTDOWN_TIMEOUT` — hard deadline for the whole drain (default `25s`; must be under the orchestrator's grace period)
+- `-memory-limit-ratio` / `MEMORY_LIMIT_RATIO` — fraction of the cgroup memory limit handed to `GOMEMLIMIT` (default `0.9`; ignored when `GOMEMLIMIT` is set)
+- `-version` — print the version, commit and platform, then exit
+- `-health-check` — probe this container's own `/readyz` and exit 0 or 1; for `HEALTHCHECK` in an image with no shell
 
 ### Agent
 
@@ -483,6 +501,89 @@ Priority: defaults → environment variables → flags.
 - `-http-retries` / `AGENT_HTTP_RETRIES` — default `2`
 - `-http-backoff` / `AGENT_HTTP_BACKOFF` — default `200ms`
 - `-log-level` / `AGENT_LOG_LEVEL` — default `info`
+- `-telemetry-addr` / `AGENT_TELEMETRY_ADDR` — probes + `/metrics` (default `:9101`; empty disables)
+- `-memory-limit-ratio` / `AGENT_MEMORY_LIMIT_RATIO` — default `0.9`
+- `-version`, `-health-check` — as for the server
+
+## Deployment
+
+The images, the compose stack, the Helm chart and the manifests all live under
+[`deploy/`](deploy/). Every one of them has been built and run; the Kubernetes
+YAML is generated from the chart and checked by tests, because a manifest is
+source code that nothing compiles.
+
+```bash
+make docker             # build the server and agent images
+make docker-smoke       # build, run, and ask the container what it is
+make compose-up         # server + agent + prometheus + grafana
+make deploy-check       # helm lint, kubeconform, manifest drift, anti-rot tests
+make vuln               # govulncheck, call-graph aware
+make compose-down
+```
+
+Then: the dashboard on <http://localhost:8080>, the scrape on
+<http://localhost:9091/metrics>, Prometheus on <http://localhost:9095>, Grafana on
+<http://localhost:3000>.
+
+### The images
+
+| Target | Base | User | Size | |
+|--------|------|------|------|--|
+| `server` | distroless static | 65532 | ~25 MB | static, `CGO_ENABLED=0` |
+| `agent` | distroless static | 65532 | ~23 MB | no packet capture |
+| `agent-pcap` | distroless static | **0** | ~24 MB | cgo, musl-static, libpcap |
+| `metricsctl` | distroless static | 65532 | ~16 MB | |
+
+No shell, no package manager, no `curl`. The container's `HEALTHCHECK` therefore
+runs the binary against itself: `server -health-check` GETs its own `/readyz` and
+exits 0 or 1. `agent-pcap` is a separate image, and runs as root, because a raw
+socket needs `CAP_NET_RAW` and a capability granted by the container runtime lands
+in the permitted set of a root process only.
+
+### Kubernetes
+
+```bash
+helm install traceforge deploy/charts/traceforge -n traceforge --create-namespace \
+  -f deploy/charts/traceforge/values-prod.yaml
+# or, with no helm:
+kubectl apply -f deploy/k8s/traceforge.yaml
+```
+
+`deploy/k8s/traceforge.yaml` is rendered from the chart by `make manifests` and
+committed; CI fails if it drifts. `values-prod.yaml` pins one server replica on
+purpose — two would be two independent stores with no replication between them.
+
+### Probes, and the order of a shutdown
+
+`/healthz` (liveness) depends on nothing: a liveness probe that checks the
+database restarts the whole fleet the minute the database has a bad one.
+`/readyz` (readiness) checks storage — for the TSDB it reports whether the
+background `fsync` is still succeeding, which is the one failure this system can
+otherwise hide for hours. `/startupz` is a fact about initialisation, not a timer.
+
+On SIGTERM the server fails readiness **first**, keeps serving for
+`-shutdown-delay`, and only then closes its listeners. `http.Server.Shutdown`
+cannot tell the load balancer; Kubernetes removes the endpoint concurrently with
+the signal, and a server that closes its listener immediately spends that window
+refusing connections that are still being routed to it. That is one burst of 502s
+per pod, on every deploy.
+
+### `/metrics`
+
+The Prometheus text exposition format is written from scratch
+([`internal/promexport`](internal/promexport/)) — the same reasoning as the series
+key encoder: an encoding is only safe if you can invert it, and a fuzz target
+proves it. CI pipes a live scrape through `promtool check metrics`, which is
+Prometheus's own validator and does not care what wrote the bytes.
+
+Everything is namespaced `traceforge_`, including the Go runtime metrics. Borrowing
+`client_golang`'s `go_*` names would make community dashboards light up with
+numbers that mean something subtly different, which is worse than showing no data.
+
+Ten alert rules ship in [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml),
+each linking a runbook in [`docs/runbooks/`](docs/runbooks/). A test asserts that
+every alert names a metric that exists and a runbook that exists, and that every
+runbook is named by exactly one alert.
 
 ## Testing & profiling
 
@@ -590,3 +691,20 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
   workflow carries longer fuzzing and mutation testing, dispatchable by hand (its
   nightly cron is committed but left commented, so a fork does not run it
   unattended).
+- **v0.11.0** — Deployment and production-readiness: distroless, statically linked
+  images (~25 MB) with a `HEALTHCHECK` that runs the binary against itself because
+  there is no shell to run `curl` with; correct liveness/readiness/startup probes
+  and a shutdown that fails readiness *before* it closes a listener, so a rolling
+  restart stops serving 502s; `GOMEMLIMIT` derived from the cgroup while
+  `GOMAXPROCS` is deliberately left to a runtime that already tracks the CPU quota
+  — which exposed worker pools sized from `runtime.NumCPU()`, a number that knows
+  nothing about a container's limits; a from-scratch Prometheus exposition format
+  (`internal/promexport`), validated by `promtool` itself; a Helm chart, manifests
+  generated from it, ten alerts, three dashboards, and a runbook per alert — all
+  held together by `test/deploy`, which is the compiler that YAML otherwise lacks:
+  it checks that every flag a manifest passes exists, every metric a dashboard
+  plots is exported, and every alert links a runbook that is really there.
+  `Storage.Ping` made the readiness probe honest and, in doing so, surfaced a real
+  bug: the TSDB's background `fsync` error was logged and dropped, so a full disk
+  meant writes that returned success, queries that answered, and nothing on disk.
+  `govulncheck` found eight reachable advisories; all are fixed.

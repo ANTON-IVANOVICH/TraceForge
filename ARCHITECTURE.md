@@ -4,8 +4,8 @@ How the system is put together: components, data flow, the concurrency model,
 storage internals, and the design decisions behind them. Kept in sync with the
 staged roadmap.
 
-- **Covers up to:** v0.10.0 (CGo: libpcap binding, and the alternatives to it)
-- **Last updated:** 2026-07-09
+- **Covers up to:** v0.11.0 (deployment: containers, Kubernetes, probes, `/metrics`)
+- **Last updated:** 2026-07-10
 - Go module: `metrics-system`. Three binaries: `agent`, `server`, `metricsctl`.
 
 ---
@@ -73,7 +73,7 @@ tick (every -interval) ─▶ collectAll ─┬─ cpu ─┐
 ### 4.1 Request path
 
 ```text
-HTTP:  mux → Recover → RequestID → Logger → RateLimit → [Authenticate] → handler
+HTTP:  mux → Metrics → Recover → RequestID → Logger → RateLimit → [Authenticate] → handler
 gRPC:  recover → log → [auth] interceptors → service method
                                                   │
                           (both) Batch ───────────┼──────────▶ pipeline.Ingest
@@ -86,8 +86,11 @@ gRPC:  recover → log → [auth] interceptors → service method
 - **gRPC** (`internal/server/grpcserver`): `metrics.v1.MetricsService` with
   `Ingest` (unary), `IngestStream` (bidirectional), `Query` (server-streaming),
   plus recovery/logging (and optional auth) interceptors and reflection.
-- Both servers run concurrently under one signal-derived context; either's
-  failure cancels the other. Shutdown order is strict (§4.6).
+- Both servers run concurrently; either's failure cancels the other. Shutdown
+  order is strict (§5.2).
+- The metrics middleware is the outermost, and that is deliberate: `Recover` turns
+  a panic into a 500 and returns normally, so anything wrapped inside it never runs
+  its post-handler code for the requests you most want in the error rate.
 
 ### 4.2 Pipeline (`internal/server/pipeline`)
 
@@ -118,6 +121,7 @@ type Storage interface {
     WriteBatch(metrics []Metric) error
     Query(q Query) ([]Metric, error)
     Stats() Stats
+    Ping(ctx context.Context) error   // answers the readiness probe; see §5.1
     Close() error
 }
 ```
@@ -287,12 +291,17 @@ Wiring them directly would let one slow receiver stall rule evaluation.
 
 ### 4.8 Lifecycle
 
-`signal.NotifyContext` (SIGINT/SIGTERM) → cancel → **HTTP, gRPC and alerting stop**
-(HTTP `Shutdown`, gRPC `GracefulStop`; rule runners are cancelled, then the
-notifier drains) → **`pipeline.Shutdown()`** drains all in-flight metrics →
-**`storage.Close()`** (flush WAL, release lock). Alerting reads storage, so it
-stops before the store closes; the pipeline drains only once every writer is gone.
-That ordering is what guarantees no data loss and no send-on-closed-channel race.
+`signal.NotifyContext` (SIGINT/SIGTERM) → **fail readiness, then wait** (§5.2) →
+cancel `runCtx` → **HTTP, gRPC and alerting stop** (HTTP `Shutdown`, gRPC
+`GracefulStop`; rule runners are cancelled, then the notifier drains) →
+**`pipeline.Shutdown()`** drains all in-flight metrics → **`storage.Close()`**
+(flush WAL, release lock) → the telemetry listener stops last. Alerting reads
+storage, so it stops before the store closes; the pipeline drains only once every
+writer is gone. That ordering is what guarantees no data loss and no
+send-on-closed-channel race.
+
+The readiness flip at the front and the telemetry listener at the back are there
+for the load balancer and the kubelet, not for the data. See §5.2.
 
 ---
 
@@ -440,13 +449,240 @@ Go port, a direct syscall via `golang.org/x/sys/unix`, a subprocess, or WASM.
 - **Config precedence:** defaults → environment variables → flags (both binaries).
 - **Logging:** structured `log/slog` JSON; every HTTP request carries an
   `X-Request-ID` propagated through context.
-- **Observability:** `GET /debug/stats` (pipeline + storage counters — including
-  `failed`, metrics accepted but lost to a storage error), `GET /healthz`
-  (public), and `net/http/pprof` on a **separate listener** (`-pprof-addr`, off
-  by default). pprof is deliberately not on the API port: `/debug/pprof/cmdline`
-  exposes the process's argv and `/heap` exposes stored data. A non-loopback bind
-  is warned about. Mutex and block profiling are opt-in
-  (`-mutex-profile-fraction`, `-block-profile-rate`).
+- **Build identity:** `internal/buildinfo` reconciles two sources. `-ldflags -X`
+  carries the version a release pipeline knows; `runtime/debug.ReadBuildInfo`
+  carries the commit and the dirty bit the Go toolchain stamps from VCS. ldflags
+  wins field by field — a deliberate release stamp beats an inferred one — except
+  for `Dirty`, which is always taken from VCS when VCS knows it, because a release
+  built from a modified tree is exactly what an operator debugging a bad rollout
+  needs to see, and the pipeline believes it is building a clean tag.
+- **Three listeners, three jobs.** The API port (`-addr`) serves users. The
+  telemetry port (`-telemetry-addr`, default `:9091`) serves `/healthz`,
+  `/readyz`, `/startupz` and `/metrics`. pprof (`-pprof-addr`, off) serves nobody
+  by default. They are separate because they have different threat models and
+  different failure modes: `/debug/pprof/cmdline` prints argv, which is where
+  `-jwt-hs256-secret` lives; `/metrics` names every tenant's alert severities; and
+  a saturated API listener is exactly when the readiness probe most needs to
+  answer, which it cannot do from behind the queue it is reporting on.
+
+### 5.1 Probes (`internal/server/health`)
+
+Three probes, and conflating any two of them is a known way to turn a degradation
+into an outage.
+
+| Probe | Answers | On failure | Checks dependencies? |
+|-------|---------|------------|----------------------|
+| `/healthz` | is this process wedged? | container restarts | **never** |
+| `/readyz` | should traffic come here? | pod leaves the Service endpoints | yes |
+| `/startupz` | has initialisation finished? | (nothing; delays liveness) | no |
+
+- **Liveness depends on nothing.** The textbook outage is a liveness probe that
+  checks the database: the database has one bad minute, every replica's liveness
+  fails at the same instant, and the orchestrator restarts the fleet while the
+  database is trying to recover.
+- **Startup is a fact, not a timer.** `time.Since(start) < 5*time.Second` reports
+  ready before a large WAL has replayed, and not-ready when the replay runs long.
+  `MarkStarted()` is called when boot actually completes.
+- **The handlers are O(1).** Checks run on a background prober and publish an
+  immutable snapshot through an `atomic.Pointer`; the handler reads it. A probe
+  handler that took the storage lock would turn one slow disk into a fleet-wide
+  readiness failure — and when the kubelet's own timeout fired, the handler's
+  goroutine would still be holding that lock.
+- **The one registered check is `Storage.Ping`.** For the TSDB it reports the last
+  *background fsync error*, not a fresh fsync. That is the failure this system can
+  otherwise hide indefinitely: `Write` returns nil (the bytes are in the page
+  cache), the head serves them back on query, and the fsync has been failing for
+  an hour on a full disk. Nothing in the write path notices. `syncLoop` used to log
+  the error and drop it; now it publishes it, and the replica leaves the load
+  balancer instead of accepting writes it cannot keep.
+
+### 5.2 Shutdown, in the only order that works
+
+`http.Server.Shutdown` closes the listener at once, then waits for in-flight
+requests. What it cannot do is tell the load balancer. Kubernetes dispatches
+SIGTERM and the endpoint removal *concurrently*, and the removal takes a moment to
+reach every kube-proxy and every ingress. A server that closes its listener on the
+first instant of SIGTERM spends that moment refusing connections that are still
+being routed to it — one burst of 502s per pod, on every deploy.
+
+So `cmd/server` runs three contexts, and `awaitShutdown` orders them:
+
+1. SIGTERM arrives. `health.SetReady(false)` — `/readyz` starts answering 503 with
+   its checks still reporting `ok`, which is how an operator tells *draining* from
+   *broken*.
+2. Wait `-shutdown-delay` (0 locally; ~5s behind a load balancer). The API keeps
+   serving. This is not a guess at how long requests take — `Shutdown` already
+   waits for those — it is a guess at how long the cluster takes to notice.
+3. Cancel `runCtx`: HTTP, gRPC and alerting drain.
+4. `pipeline.Shutdown()`, then `store.Close()` (flush the WAL, release the lock).
+5. Cancel `telCtx` last, so the probes answer throughout and the final scrape
+   before the pod disappears is not a connection refused.
+
+`-shutdown-timeout` (25s) is a hard deadline on steps 3–4, deliberately under
+Kubernetes' default 30s grace period. The chart derives
+`terminationGracePeriodSeconds` from it, and a test asserts
+`delay < timeout < gracePeriod`.
+
+### 5.3 `/metrics`, written from scratch (`internal/promexport`)
+
+The Prometheus text exposition format (v0.0.4) is an encoding, and this project
+writes its own encodings. `internal/server/storage/serieskey.go` is the precedent:
+an encoding is only safe if it is unambiguous, and the way to know is to invert it.
+`FuzzWriteRoundTrip` is the same proof `ParseSeriesKey` was.
+
+Three details are the whole job:
+
+- **HELP escaping and label-value escaping differ.** HELP escapes `\` and newline.
+  A label value also escapes `"`. A metric name may contain `:`; a label name may
+  not.
+- **Histograms, not summaries.** Buckets are cumulative and `le="+Inf"` equals
+  `_count`. A summary computes its quantiles inside one process, and there is no
+  way to average a p99 across replicas; buckets add. `histogram_quantile` runs at
+  query time, in Prometheus.
+- **Every label is bounded.** `route` is the mux's registered pattern (obtained
+  from `http.ServeMux.Handler`, not from `r.URL.Path`), and an unmatched request
+  is folded into `route="other"`. Both vectors carry a hard cardinality cap with a
+  visible `__overflow__` series: a silent drop hides the fact that the labelling is
+  wrong. A `/metrics` endpoint whose cardinality is driven by request input is a
+  memory leak with a scrape interval.
+
+Runtime metrics come from `runtime/metrics`, not `runtime.ReadMemStats`, which
+stops the world for the duration of the read. They are namespaced
+`traceforge_go_*` rather than borrowing `client_golang`'s `go_*` names, because a
+community dashboard panel that silently means something slightly different is worse
+than one that shows no data.
+
+---
+
+## 5b. Containers and Kubernetes (`deploy/`)
+
+### 5b.1 GOMAXPROCS, GOMEMLIMIT, and the advice that is now wrong
+
+`internal/container` sets `GOMEMLIMIT` from the cgroup and deliberately does **not**
+set `GOMAXPROCS`.
+
+Since Go 1.25 the runtime derives the default `GOMAXPROCS` on Linux from the cgroup
+CPU quota, and *re-derives it periodically* as the quota changes. The formula is not
+a plain minimum, and the difference bites in exactly the container this exists for
+(`runtime/cgroup_linux.go`, `adjustCgroupGOMAXPROCS`):
+
+```text
+GOMAXPROCS = min(CPUs from sched_getaffinity, max(ceil(quota/period), 2))
+```
+
+A fractional quota rounds up — `--cpus=1.5` gives 2 — and a sub-two-core quota is
+floored at 2 unless the affinity mask allows fewer. `--cpus=1` on an eight-core host
+gives 2, not 1.
+
+Setting the `GOMAXPROCS` environment variable, which almost every Helm chart does
+through the downward API, **disables that updating**. So does calling
+`runtime.GOMAXPROCS(n)` with any positive `n`, including the innocent-looking
+`runtime.GOMAXPROCS(runtime.NumCPU())`. (`runtime.GOMAXPROCS(0)` is a safe read: the
+runtime returns before it marks the value custom. This package reads
+`/sched/gomaxprocs:threads` from `runtime/metrics` instead, so the dangerous call is
+not merely discouraged but unrepresentable.)
+
+`GOMEMLIMIT` is the opposite case: the runtime does not derive it from anything.
+Left unset, the heap grows until the cgroup's hard limit and the kernel OOM-kills a
+process that would have run a GC instead. So the binary reads `memory.max` — walking
+the cgroup v2 chain to the root and taking the minimum, because a parent's limit
+binds its children whatever the leaf says — and calls `debug.SetMemoryLimit`.
+
+The ratio (`-memory-limit-ratio`, default 0.9) is a knob and not a constant because
+**`GOMEMLIMIT` bounds only what the Go runtime manages.** It does not bound the
+binary's text, allocations made by cgo, or file pages brought in by `mmap` — and this
+project's TSDB mmaps its chunk files. Those pages count against the cgroup and are
+invisible to `GOMEMLIMIT`. The headroom below 1.0 is where they live.
+
+The same reasoning found a real bug: the pipeline sized its worker pools from
+`runtime.NumCPU()`, which reports the machine's cores and knows nothing about a
+quota. On an 8-core host with `--cpus=1.5` that started sixteen goroutines to share
+two Ps. They are sized from `GOMAXPROCS` now.
+
+### 5b.2 The images
+
+One `deploy/docker/Dockerfile`, four targets.
+
+| Target | Base | User | Size | Notes |
+|--------|------|------|------|-------|
+| `server` | `distroless/static:nonroot` | 65532 | ~25 MB | static, `CGO_ENABLED=0` |
+| `agent` | `distroless/static:nonroot` | 65532 | ~23 MB | no packet capture |
+| `agent-pcap` | `distroless/static` | **0** | ~24 MB | cgo, musl-static, libpcap 1.10.6 |
+| `metricsctl` | `distroless/static:nonroot` | 65532 | ~16 MB | |
+
+- The builder stage is `FROM --platform=$BUILDPLATFORM golang:1.26-alpine`. Without
+  it, a multi-platform build fetches the *target*'s Go image and runs the compiler
+  under QEMU — minutes instead of seconds, to cross-compile a language that
+  cross-compiles for free.
+- `agent-pcap` is the one stage that cannot do that: cgo needs a C toolchain and
+  libpcap's headers for the *target*. It builds natively, under emulation when the
+  architectures differ. That is the tax CGo levies, and `make cross-cgo` exists to
+  fail on purpose.
+- It runs as **root**, and it is a separate image for that reason. Opening a raw
+  socket needs `CAP_NET_RAW`, and a capability granted by the container runtime
+  lands in the permitted set of a *root* process; a non-root process needs file or
+  ambient capabilities, which distroless does not provide. The chart selects this
+  image only when `agent.capture.enabled` is set.
+- distroless has no shell, so a shell-form `HEALTHCHECK` cannot run. The exec form
+  can, given something in the image that speaks HTTP — and the binary already does:
+  `server -health-check` GETs its own `/readyz` and exits 0 or 1.
+- A fresh named volume inherits the ownership of the image's directory at its mount
+  point. The runtime stage has no shell to `mkdir` with, so the data directory is
+  created in the builder stage and `COPY --chown=65532:65532`'d across. Kubernetes
+  solves the same problem with `fsGroup`, which is why the chart sets it.
+
+### 5b.3 The chart is the source; the manifests are generated
+
+`deploy/charts/traceforge` is the only hand-written Kubernetes YAML.
+`deploy/k8s/traceforge.yaml` is rendered from it by `make manifests` and committed,
+so an operator without helm can `kubectl apply -f`, and so the Go tests in
+`test/deploy` can assert on the exact bytes a cluster receives. CI runs
+`make manifests-check` and fails on a diff.
+
+`values-prod.yaml` pins `server.replicas: 1`. Two replicas would be two independent
+stores with no replication between them — data loss dressed as scale-out. Horizontal
+scaling waits for clustering.
+
+### 5b.4 Deployment artefacts are source code with no compiler
+
+Nothing compiles a manifest, executes a dashboard, or type-checks an alert. So
+`test/deploy` is their compiler:
+
+- every `-flag` in a manifest is cross-checked against the flag names parsed out of
+  `cmd/server` and `cmd/agent` with `go/ast` — a container started with an unknown
+  flag exits 2 with a usage message nobody is tailing;
+- every `traceforge_*` token in every dashboard panel and every alert expression must
+  be a metric some binary really exports — a misspelled metric renders an empty graph,
+  which is indistinguishable from a healthy system;
+- every alert's `runbook_url` must name a file that exists, and every runbook must be
+  named by exactly one alert;
+- the rendered manifests must be hardened (`runAsNonRoot`, `readOnlyRootFilesystem`,
+  `drop: [ALL]`, `seccompProfile: RuntimeDefault`, resources on both sides, no
+  `:latest`, probes on ports the container actually declares);
+- `shutdown-delay < shutdown-timeout < terminationGracePeriodSeconds`.
+
+The exposition format has an external oracle: CI pipes a live scrape through
+`promtool check metrics`, which is Prometheus's own validator and does not care what
+wrote the bytes.
+
+### 5b.5 Supply chain
+
+`govulncheck` walks the call graph, so a vulnerable function nothing calls does not
+fail the build. That precision is what makes it worth gating on. It found eight
+reachable advisories at the start of this stage — six in the standard library, fixed
+by `toolchain go1.26.5`, and two in `grpc` and `x/net`. All are gone.
+
+`.goreleaser.yaml` builds archives for linux/darwin (and metricsctl for Windows),
+generates an SPDX SBOM per archive, and signs the checksum file with **keyless**
+Sigstore: no private key exists, the identity comes from the GitHub Actions OIDC
+token, and the signature lands in Rekor's public transparency log. Images are built
+by `docker buildx` in the release workflow rather than by GoReleaser, because
+`agent-pcap` must be compiled on the architecture it runs on.
+
+The release workflow's tag trigger is **commented out**. A tag-triggered release
+pushes images to a registry and writes an append-only entry into a public transparency
+log, and nobody following along with this repository has consented to either by typing
+`git push --tags`.
 
 ---
 
@@ -462,6 +698,10 @@ internal/
     network/                libpcap binding (CGo) + pure-Go packet parser
     kernel/                 /proc/net counters — the same metrics, no CGo
   auth/                     principal/RBAC, API keys, JWT (HS256/RS256), JWKS
+  buildinfo/                version/commit/dirty: ldflags reconciled with VCS
+  container/                cgroup memory limit -> GOMEMLIMIT (GOMAXPROCS left alone)
+  promexport/               from-scratch Prometheus text exposition + counter/gauge/histogram
+  telemetry/                the admin listener: probes + /metrics + SelfCheck
   benchcmp/                 go test -bench parser + Mann-Whitney U test
   mutate/                   AST mutators + go test -overlay runner
   clock/                    injectable time: Real + deterministic Fake
@@ -486,10 +726,20 @@ internal/
     storage/                Storage interface, query engine, memory|bolt|tsdb
     live/                   from-scratch WebSocket + broadcast hub
     ratelimit/              per-agent token-bucket limiter
+    health/                 liveness/readiness/startup + background prober
 examples/alerting/          sample rules + receivers configuration
 web/                        embedded dashboard SPA (go:embed)
 pkg/httpx/                  reusable HTTP client (retry + backoff)
+deploy/
+  docker/Dockerfile         4 targets: server, agent, agent-pcap (cgo), metricsctl
+  compose.yaml              server + agent, and prometheus/grafana behind a profile
+  charts/traceforge/        the Helm chart: the only hand-written Kubernetes YAML
+  k8s/traceforge.yaml       rendered from the chart by `make manifests`, drift-checked
+  prometheus/               scrape config + 10 alert rules, each linking a runbook
+  dashboards/               3 Grafana dashboards, metric names checked by a test
+docs/runbooks/              one per alert; structure enforced by a test
 test/e2e/                   //go:build e2e: real binaries as separate processes
+test/deploy/                the compiler the deployment artefacts otherwise lack
 ```
 
 ---
@@ -573,10 +823,23 @@ run its own server concurrently with no port registry.
 
 ## 8. What's next
 
-Single-node today. The roadmap (see the wiki `Roadmap` and `CHANGELOG.md`) adds a
-testing/benchmarking/profiling deep-dive, CGo integration, and a production
-deployment. Clustering (gossip membership, consistent-hash sharding, Raft) is a
-natural extension beyond the staged plan. This document is updated as each lands.
+Single-node, and now deployable. The staged plan is complete: the testing,
+benchmarking and profiling deep-dive, the CGo boundary, and a production
+deployment have all landed.
+
+What is deliberately absent, and what it would take:
+
+- **Clustering.** `values-prod.yaml` pins one replica because two would be two
+  independent stores. Gossip membership, consistent-hash sharding of series across
+  nodes, and Raft for the alerting state would make `replicas: 3` mean something.
+  Everything in the chart that says "single-node" is a marker for that work.
+- **Distributed tracing.** The metrics and the logs both carry a request id; a
+  trace would carry it across the agent→server→storage boundary. The interesting
+  part is W3C trace-context propagation and sampling, not the exporter — and an
+  exporter with no collector to send to would be code nobody has run, which this
+  project does not ship.
+- **Persistent alerting state.** The rule, state and silence stores are in-memory:
+  a restart forgets pending retries and silences, and re-arms `for` windows.
 
 Known limitations of the alerting subsystem, deliberately deferred: the rule,
 state and silence stores are in-memory (a restart forgets pending retries and

@@ -7,6 +7,225 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-10
+
+Deployment. The step from "works on my machine" to "an operator can run this, and
+when it breaks at 03:00 they have somewhere to look".
+
+The theme of the stage is that a deployment artefact is source code that nothing
+compiles. A Kubernetes manifest passing a flag the binary no longer has is
+syntactically perfect. A dashboard naming a metric that was renamed shows an empty
+graph, which is indistinguishable from a healthy system, and stays that way until
+somebody looks at it during an incident. So the artefacts here are all verified —
+the images were built and run, the chart was rendered and validated against the
+Kubernetes schemas, the exposition format was checked by Prometheus's own
+`promtool`, and `test/deploy` is the compiler the YAML otherwise lacks.
+
+### Added
+
+- **Probes done properly** (`internal/server/health`). `/healthz` (liveness)
+  depends on nothing — a liveness probe that checks the database restarts the
+  whole fleet the minute the database has a bad one. `/readyz` (readiness) checks
+  dependencies and carries the drain gate. `/startupz` is a fact about
+  initialisation, never a timer. The handlers are O(1): checks run on a background
+  prober and publish an immutable snapshot through an `atomic.Pointer`, because a
+  probe handler that took the storage lock would turn one slow disk into a
+  fleet-wide readiness failure.
+- **`Storage.Ping(ctx)`** on the interface, and with it a readiness check that is
+  worth having: the TSDB reports its last *background fsync error*.
+- **A shutdown in the only order that works.** On SIGTERM the server fails
+  readiness first, keeps serving for `-shutdown-delay`, and only then closes its
+  listeners. `http.Server.Shutdown` cannot tell the load balancer, and Kubernetes
+  removes the endpoint concurrently with the signal; a server that closes its
+  listener immediately spends that window refusing connections still being routed
+  to it. Three contexts (`sigCtx`, `runCtx`, `telCtx`) keep the phases apart; the
+  telemetry listener stops last so the final scrape is not a connection refused.
+  `-shutdown-timeout` bounds the whole drain.
+- **`/metrics`, written from scratch** (`internal/promexport`): the Prometheus text
+  exposition format v0.0.4, with the escaping rules stated, tested, and proven
+  invertible by a round-trip fuzz target — the same discipline as the series-key
+  encoder. Counters, gauges, cumulative histograms and labelled vectors with a hard
+  cardinality cap and a visible `__overflow__` series. Validated in CI by
+  `promtool check metrics` against a live scrape.
+- **RED metrics for the HTTP API** (`internal/server/httpmetrics.go`). The `route`
+  label is the mux's registered *pattern*, obtained from `http.ServeMux.Handler`,
+  never `r.URL.Path`; unmatched requests fold into `route="other"`. A hijacked
+  connection (the WebSocket) is counted as a 101 but its duration is not observed,
+  because a browser tab's lifetime in a latency histogram moves the server's p99 to
+  "one hour". The middleware sits *outside* `Recover`, so panicking requests appear
+  in the error rate.
+- **Self-metrics for both binaries**: pipeline counters, storage size, rate-limiter
+  bucket count, active alerts by state and severity, agent collect/send counters,
+  and `traceforge_build_info` — a constant-1 gauge whose labels make
+  `count by (version) (traceforge_build_info)` answer "how far has the rollout got".
+  Runtime metrics come from `runtime/metrics`, not `ReadMemStats`, which stops the
+  world; they are namespaced `traceforge_go_*` rather than borrowing
+  `client_golang`'s `go_*` names, because a dashboard panel that silently means
+  something else is worse than one that shows no data.
+- **A telemetry listener** (`internal/telemetry`), separate from the API port and
+  from pprof. `/metrics` names every tenant's alert severities; pprof's
+  `/debug/pprof/cmdline` prints argv, which is where `-jwt-hs256-secret` lives; and
+  a saturated API listener is exactly when the readiness probe most needs to answer.
+- **`internal/buildinfo`**: `-ldflags -X` reconciled with `debug.ReadBuildInfo`.
+  ldflags wins field by field, except the dirty bit, which is always VCS's — a
+  release built from a modified tree is what an operator debugging a bad rollout
+  needs to see, and the pipeline believes it is building a clean tag. `-version` on
+  every binary; `metricsctl version` now reports the commit and the dirty flag.
+- **`internal/container`**: `GOMEMLIMIT` derived from the cgroup memory limit,
+  walking the cgroup v2 chain to the root and taking the minimum, because a parent's
+  limit binds its children whatever the leaf says. The ratio is a knob and not a
+  constant because `GOMEMLIMIT` does not bound `mmap`'d file pages, and the TSDB
+  mmaps its chunk files.
+- **`-health-check`** on the server and the agent: the binary GETs its own `/readyz`
+  and exits 0 or 1. distroless has no shell, so a shell-form `HEALTHCHECK` cannot
+  run and there is no `curl` for the exec form to call. The binary was already
+  there; it only needed a flag.
+- **Images** (`deploy/docker/Dockerfile`): four targets, all distroless and static.
+  `server`, `agent` and `metricsctl` are `CGO_ENABLED=0` and cross-compile from
+  `$BUILDPLATFORM` in seconds; `agent-pcap` links libpcap 1.10.6 statically against
+  musl and — alone among them — runs as root, because a raw socket needs
+  `CAP_NET_RAW` and a capability granted by the runtime lands in the permitted set
+  of a root process only.
+- **`deploy/compose.yaml`**: server + agent, with Prometheus and Grafana behind a
+  profile. The Kubernetes manifests are hard to try, and a thing nobody tries is a
+  thing nobody trusts.
+- **A Helm chart** (`deploy/charts/traceforge`), and `deploy/k8s/traceforge.yaml`
+  rendered from it by `make manifests` and committed, so an operator without helm
+  can `kubectl apply -f` and so the Go tests can read the exact bytes a cluster
+  receives. CI fails on drift. `values-prod.yaml` pins one replica: two would be two
+  independent stores with no replication, which is data loss dressed as scale-out.
+- **Ten alert rules, three dashboards, ten runbooks** — one per alert, each linked
+  from the alert's `runbook_url`, each structured for someone who did not write the
+  code and was asleep ninety seconds ago.
+- **`test/deploy`**, the compiler the deployment artefacts otherwise lack: every
+  `-flag` in a manifest is cross-checked against the flag names parsed out of the
+  `cmd/` sources with `go/ast`; every `traceforge_*` token in a dashboard or an alert
+  must be a metric a binary really exports; every alert must link a runbook that
+  exists and every runbook must be named by exactly one alert; the rendered manifests
+  must be hardened; and `shutdown-delay < shutdown-timeout <
+  terminationGracePeriodSeconds`.
+- **Supply chain**: `.goreleaser.yaml` (archives, SPDX SBOMs, keyless Sigstore
+  signing), a `workflow_dispatch`-gated release workflow with a `push` input that
+  defaults to false, `govulncheck` and Trivy in CI, and multi-arch image builds. The
+  release workflow's tag trigger is committed but commented out: a tag-triggered
+  release pushes images to a registry and writes an append-only entry into a public
+  transparency log, and nobody typing `git push --tags` has consented to that.
+
+### Fixed
+
+- **The TSDB's background `fsync` error was logged and dropped.** `syncLoop` called
+  `wal.Sync()`, wrote the failure to the log, and continued. Meanwhile `Write`
+  returned nil (the bytes were in the page cache), the head served them back on
+  query, and nothing anywhere was red. On a full disk this is the worst state a
+  durable store can be in: it looks healthy, it answers every request, and it is
+  keeping nothing. The error is now published and `Ping` reports it, so the replica
+  fails readiness and leaves the load balancer. A regression test breaks the WAL's
+  file descriptor underneath the sync loop and asserts `Ping` notices while `Query`
+  still succeeds — because that combination is the whole point.
+- **The pipeline sized its worker pools from `runtime.NumCPU()`.** That number is
+  the machine's cores narrowed by the affinity mask; it knows nothing about a cgroup
+  CPU *quota*. On an eight-core host with `--cpus=1.5` the server started eight
+  validate and eight enrich workers to share one and a half cores of quota. They are
+  sized from `GOMAXPROCS` now, which the Go runtime derives from the quota — and
+  keeps re-deriving, which is precisely why this project never sets it.
+- **Eight reachable vulnerabilities**, found by `govulncheck`: six in the standard
+  library (`crypto/tls`, `crypto/x509`, `net/http`, `net/textproto`, `html/template`,
+  `net`), fixed by pinning `toolchain go1.26.5`; and two in dependencies, fixed by
+  `google.golang.org/grpc` v1.79.3 and `golang.org/x/net` v0.53.0. The scan now
+  reports zero reachable.
+
+### Fixed (found by the stage's own adversarial review)
+
+Four reviewers, then two skeptics per finding whose job was to refute it. Nine
+survived.
+
+- **The release workflow could not have released anything.** Both hand-assembled
+  image references — the one `cosign` signs and the one Trivy scans — interpolated
+  `github.repository_owner` raw. An OCI repository name may not contain an
+  uppercase letter, and this owner login does; `docker/metadata-action` silently
+  lowercases what it is given, so the *build and push* worked while both steps that
+  spelled the name themselves would have failed. Trivy's reference was doubly
+  wrong: `{{version}}` strips the leading `v`, so `:v0.11.0` was a tag no push ever
+  created. The name is now computed once, lowercased, and shared.
+- **A capture agent's ingest would have been silently dropped.** Packet capture
+  needs `hostNetwork` — a raw socket in the pod's own namespace sees a veth and
+  nothing else — and a `hostNetwork` pod's packets carry the node's address and none
+  of the pod's labels, so the server's NetworkPolicy `podSelector` could never match
+  them. Nothing would break loudly: the agent keeps collecting, the server keeps
+  serving, the metrics stop arriving. The chart now `fail`s the render unless
+  `networkPolicy.nodeCIDRs` is set alongside capture.
+- **Every pod would have been scraped twice.** The ServiceMonitor's selector matched
+  both server Services — headless and ClusterIP, which share their selector labels
+  and both publish the telemetry port — and the `prometheus.io/scrape` annotations
+  were emitted unconditionally beside it. The annotations are now mutually exclusive
+  with the ServiceMonitor, and exactly one Service carries `traceforge.io/scrape`.
+- **`TestShutdownBudgetsAreConsistent` could check nothing and pass.** Deleting
+  `-shutdown-timeout` from the manifest made `argDuration` return 0, the loop
+  `continue`d past every container, and both ordering assertions were never reached.
+  Every sibling test in that file has a "this test is checking nothing" floor; this
+  one now does too.
+- **Three comments stated things that are false**, which this project treats as
+  defects rather than as prose:
+  - The Makefile claimed the Go toolchain stamps VCS metadata into "any binary built
+    inside a git tree, which is why `go run` and `go test` need nothing". They are
+    not stamped: `go test -c` produces a binary with no `vcs.*` settings, and
+    `go run ./cmd/metricsctl version` prints `dev (unknown, unknown, …)`.
+  - `httpmetrics.go` claimed that "404s, 405s and redirects have no pattern".
+    Redirects do: `ServeMux` answers `GET /foo` with a 307 to `/foo/` and reports
+    the *registered* pattern. Harmless for cardinality, wrong as written, and now
+    covered by a test that reads the status rather than asserting it.
+  - `internal/container` described the runtime's GOMAXPROCS derivation as a plain
+    minimum. It is `min(affinity CPUs, max(ceil(quota), 2))` — a fractional quota
+    rounds up and a sub-two-core quota is floored at two. `--cpus=1` on an
+    eight-core host gives GOMAXPROCS=2, not 1.
+- **The container images stamped a build date unrelated to the commit.**
+  `github.event.repository.updated_at` changes when somebody edits the repository
+  description; the archives already used `.CommitDate`. The same tag rebuilt later
+  produced different bytes. The date now comes from the tagged commit.
+- Workflow inputs are passed through `env:` rather than interpolated into `run:`,
+  where `${{ }}` is textual substitution the shell never sees as data.
+
+### Changed
+
+- `Handler.Routes()` returns `*http.ServeMux` rather than `http.Handler`, because
+  the metrics middleware has to ask the mux which pattern a request matched.
+- `cli.NewRootCmd` takes a `buildinfo.Info` instead of a version string, so
+  `metricsctl version -o json` reports the commit, the build date and the dirty flag.
+- The Makefile's `-ldflags` now target `internal/buildinfo` rather than
+  `main.version`, so every binary reports its build the same way.
+- `-validate-workers` and `-enrich-workers` default to `GOMAXPROCS` rather than
+  `NumCPU`.
+
+### Notes
+
+- `-telemetry-addr` defaults to `:9091` and is therefore **on**, unlike every other
+  subsystem this project has added. Auth, alerting, packet capture and pprof all cost
+  something or expose something. A liveness probe costs nothing, and a probe you have
+  to remember to enable is a probe that is missing on the day it matters. `/metrics`
+  does expose the process's internals — which is why it shares a listener you can
+  firewall, rather than sitting on the API port.
+- `GOMAXPROCS` is never set, and this is the one piece of common Helm-chart advice
+  the chart deliberately contradicts. Since Go 1.25 the runtime derives it from the
+  cgroup CPU quota and re-derives it as the quota changes; setting the environment
+  variable through the downward API freezes that. So does calling
+  `runtime.GOMAXPROCS(n)` with any positive `n` — including
+  `runtime.GOMAXPROCS(runtime.NumCPU())`, which looks like a no-op and is not.
+  `internal/container` reads the value from `runtime/metrics`, which has no setter,
+  so the mistake is not merely discouraged but unrepresentable.
+- Distributed tracing is documented as absent rather than shipped. The interesting
+  part is W3C trace-context propagation and sampling, not the exporter — and an
+  exporter with no collector to send to would be code nobody has run, which is what
+  the previous stage's discipline was about.
+
+### Dependencies
+
+- **No new modules.** `prometheus/client_golang` would have added a dependency tree
+  to emit a text format whose entire content is a few hundred lines of escaping
+  rules — rules this project can state, test and prove invertible itself, exactly as
+  it did for the series-key encoder, the WAL and the libpcap binding.
+- `google.golang.org/grpc` v1.76.0 → v1.79.3 and `golang.org/x/net` v0.42.0 → v0.53.0
+  (both `govulncheck`-reachable). `toolchain go1.26.5` pinned in `go.mod`.
+
 ## [0.10.0] - 2026-07-10
 
 CGo: the project leaves pure Go for the first time, to do something Go cannot —
@@ -616,7 +835,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.7.0...v0.8.0

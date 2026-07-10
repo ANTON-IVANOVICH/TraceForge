@@ -1,0 +1,235 @@
+{{- $svc := .Values.server -}}
+{{- $delay := int $svc.shutdown.delaySeconds -}}
+{{- $timeout := int $svc.shutdown.timeoutSeconds -}}
+{{- $graceBuffer := int $svc.shutdown.graceBufferSeconds -}}
+{{/*
+Shutdown arithmetic, enforced here so a bad values file fails render, not prod:
+  -shutdown-delay ({{ $delay }}s) < -shutdown-timeout ({{ $timeout }}s)
+  terminationGracePeriodSeconds = timeout + graceBuffer = {{ $timeout }} + {{ $graceBuffer }} = {{ add $timeout $graceBuffer }}s
+  ... and that total is strictly greater than the process's own {{ $timeout }}s deadline,
+  so the kubelet's SIGKILL only ever lands AFTER the process has given up and
+  logged which drain step hung — never in the middle of a healthy drain.
+*/}}
+{{- if ge $delay $timeout -}}
+{{- fail (printf "server.shutdown.delaySeconds (%d) must be strictly less than timeoutSeconds (%d): the process must start closing listeners before its own hard deadline" $delay $timeout) -}}
+{{- end -}}
+{{- if $svc.auth.enabled -}}
+{{- if not $svc.auth.existingSecret -}}
+{{- fail "server.auth.enabled is true but server.auth.existingSecret is empty. This chart NEVER templates a secret into args or a ConfigMap; the HS256/JWT secret must come from a pre-created Secret via secretKeyRef. Set server.auth.existingSecret, or disable auth." -}}
+{{- end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "traceforge.server.fullname" . }}
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  serviceName: {{ include "traceforge.server.fullname" . }}-headless
+  # replicas comes straight from values and is 1 by default AND in prod. The
+  # server has no replication; see values-prod.yaml for why >1 is data loss.
+  replicas: {{ $svc.replicas }}
+  selector:
+    matchLabels:
+      {{- include "traceforge.server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "traceforge.server.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if not .Values.metrics.serviceMonitor.enabled }}
+        # Scrape annotations, for a Prometheus that discovers pods directly.
+        #
+        # They are mutually exclusive with the ServiceMonitor, which is why they are
+        # gated on it. A cluster running the operator typically also runs an
+        # annotation-based pod-discovery job, and with both present every pod is
+        # discovered twice: the same series arrive under two target labels, doubling
+        # the scrape load and — when the differing labels are dropped by a relabel
+        # rule — producing "duplicate sample for timestamp" rejections.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $svc.telemetry.port | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- if $svc.alerting.enabled }}
+        # Roll the pod when the alerting config changes, so an edited ConfigMap
+        # actually takes effect instead of waiting for an unrelated restart.
+        checksum/alerting: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "traceforge.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "traceforge.podSecurityContext" . | nindent 8 }}
+      # timeout ({{ $timeout }}s) + graceBuffer ({{ $graceBuffer }}s) = {{ add $timeout $graceBuffer }}s of head-room.
+      terminationGracePeriodSeconds: {{ add $timeout $graceBuffer }}
+      # NO preStop "sleep" hook: the distroless image has no shell to run one, and
+      # -shutdown-delay does exactly that job INSIDE the process — it fails
+      # readiness first so the load balancer drains the endpoint, then waits, then
+      # closes listeners. A hook would be a redundant second timer with no shell.
+      {{- with $svc.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $svc.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if $svc.affinity }}
+        {{- toYaml $svc.affinity | nindent 8 }}
+        {{- else if $svc.podAntiAffinity.enabled }}
+        # Preferred (not required) so a single-node cluster still schedules; when
+        # replicas>1 it keeps them off the same node without blocking the pod.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "traceforge.server.selectorLabels" . | nindent 20 }}
+        {{- end }}
+      {{- with $svc.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: server
+          image: {{ include "traceforge.image" (dict "repo" $svc.image.repository "tag" $svc.image.tag "root" $) }}
+          imagePullPolicy: {{ $svc.image.pullPolicy }}
+          args:
+            - -addr=:{{ $svc.http.port }}
+            {{- if $svc.grpc.enabled }}
+            - -grpc-addr=:{{ $svc.grpc.port }}
+            {{- else }}
+            # Empty address disables the gRPC listener entirely.
+            - -grpc-addr=
+            {{- end }}
+            - -telemetry-addr=:{{ $svc.telemetry.port }}
+            - -storage={{ $svc.storage }}
+            - -data-dir={{ $svc.dataDir }}
+            - -log-level={{ $svc.logLevel }}
+            - -ingest-buffer={{ $svc.ingestBuffer }}
+            {{- if gt (int $svc.validateWorkers) 0 }}
+            - -validate-workers={{ $svc.validateWorkers }}
+            {{- end }}
+            {{- if gt (int $svc.enrichWorkers) 0 }}
+            - -enrich-workers={{ $svc.enrichWorkers }}
+            {{- end }}
+            {{- if gt (int $svc.storeWorkers) 0 }}
+            - -store-workers={{ $svc.storeWorkers }}
+            {{- end }}
+            - -rate-limit-rps={{ $svc.rateLimit.rps }}
+            - -rate-limit-burst={{ $svc.rateLimit.burst }}
+            - -ui={{ $svc.ui }}
+            - -shutdown-delay={{ $delay }}s
+            - -shutdown-timeout={{ $timeout }}s
+            - -memory-limit-ratio={{ $svc.memoryLimitRatio }}
+            {{- if $svc.pprofAddr }}
+            - -pprof-addr={{ $svc.pprofAddr }}
+            {{- end }}
+            {{- if $svc.auth.enabled }}
+            - -auth
+            {{- if $svc.auth.jwksUrl }}
+            - -jwks-url={{ $svc.auth.jwksUrl }}
+            {{- end }}
+            {{- if $svc.auth.issuer }}
+            - -jwt-issuer={{ $svc.auth.issuer }}
+            {{- end }}
+            {{- if $svc.auth.audience }}
+            - -jwt-audience={{ $svc.auth.audience }}
+            {{- end }}
+            {{- end }}
+            {{- if $svc.alerting.enabled }}
+            - -alerting
+            - -alert-lookback={{ $svc.alerting.lookback }}
+            - -alert-buffer={{ $svc.alerting.buffer }}
+            - -alert-rules=/etc/traceforge/alerting/rules.json
+            - -alert-config=/etc/traceforge/alerting/config.json
+            {{- end }}
+            {{- with $svc.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # NO GOMAXPROCS from the downward API: since Go 1.25 the runtime reads
+            # the cgroup CPU quota and keeps re-deriving GOMAXPROCS as the quota
+            # changes; pinning the env var freezes that at the launch-time value
+            # and mis-sizes the scheduler after a vertical resize.
+            # NO GOMEMLIMIT either: the binary derives it from the cgroup memory
+            # limit via -memory-limit-ratio; setting it here would override that.
+            {{- if $svc.auth.enabled }}
+            - name: JWT_HS256_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $svc.auth.existingSecret }}
+                  key: {{ $svc.auth.hs256SecretKey }}
+                  # optional: the operator may run JWKS-only (RS256) auth with no
+                  # HS256 secret in the Secret at all.
+                  optional: true
+            {{- end }}
+            {{- with $svc.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.http.port }}
+            {{- if $svc.grpc.enabled }}
+            - name: grpc
+              containerPort: {{ $svc.grpc.port }}
+            {{- end }}
+            - name: telemetry
+              containerPort: {{ $svc.telemetry.port }}
+          {{- include "traceforge.probes" . | nindent 10 }}
+          securityContext:
+            {{- include "traceforge.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          volumeMounts:
+            # The data PVC. With a read-only root filesystem this is the only
+            # writable place bolt/tsdb can persist to.
+            - name: data
+              mountPath: {{ $svc.dataDir }}
+            # /tmp must be a writable emptyDir precisely because the root fs is
+            # read-only; the process still needs scratch space for temp files.
+            - name: tmp
+              mountPath: /tmp
+            {{- if $svc.alerting.enabled }}
+            - name: alerting
+              mountPath: /etc/traceforge/alerting
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if $svc.alerting.enabled }}
+        - name: alerting
+          configMap:
+            name: {{ include "traceforge.server.fullname" . }}-alerting
+        {{- end }}
+  # The data directory is a per-pod PVC, not a shared one: each server owns its
+  # own store. This is also what makes storage=tsdb persistent across restarts.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "traceforge.server.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml $svc.persistence.accessModes | nindent 10 }}
+        {{- if $svc.persistence.storageClassName }}
+        storageClassName: {{ $svc.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $svc.persistence.size }}

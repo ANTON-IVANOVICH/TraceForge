@@ -1,8 +1,11 @@
 package tsdb
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,5 +200,105 @@ func TestTSDB_LockPreventsSecondOpen(t *testing.T) {
 
 	if _, err := Open(dir, testLogger()); err == nil {
 		t.Fatal("second Open of a locked dir should fail")
+	}
+}
+
+// The state this test protects against is the worst one a durable store can be
+// in: writes return nil, queries return the data, and the fsync that would make
+// any of it survive a power cut has been failing since the disk filled up. The
+// write path never learns of it — only the background sync loop does, and before
+// Ping existed it logged the error and dropped it on the floor.
+//
+// Closing the WAL's file underneath the sync loop reproduces the symptom exactly:
+// Flush finds an empty buffer and succeeds, then fsync fails on a closed
+// descriptor. The database keeps serving.
+func TestTSDB_PingReportsAFailingFsync(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Close() would fsync a WAL we are about to break; the file lock is released
+	// with the temp dir.
+	defer func() { _ = releaseLock(db.lock) }()
+
+	if err := db.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping on a healthy database: %v", err)
+	}
+
+	// Break durability without breaking anything a caller can see.
+	if err := db.wal.Close(); err != nil {
+		t.Fatalf("closing the wal file: %v", err)
+	}
+
+	// syncLoop ticks every syncInterval; give it a few ticks to notice.
+	deadline := time.Now().Add(2 * time.Second)
+	var pingErr error
+	for time.Now().Before(deadline) {
+		if pingErr = db.Ping(t.Context()); pingErr != nil {
+			break
+		}
+		time.Sleep(syncInterval / 2)
+	}
+	if pingErr == nil {
+		t.Fatal("Ping still reports the database healthy after every fsync failed")
+	}
+	if !strings.Contains(pingErr.Error(), "wal not syncing") {
+		t.Errorf("Ping error = %v, want it to name the failing fsync", pingErr)
+	}
+
+	// The query path is deliberately unaffected: this is the point. A store whose
+	// fsync fails is not a store that stops answering, which is why the readiness
+	// probe is the only thing that can catch it.
+	if _, err := db.Query(storage.Query{Name: "nothing"}); err != nil {
+		t.Errorf("Query broke too, so the probe was not the only signal: %v", err)
+	}
+}
+
+// A disk that filled up and was cleaned out must bring the replica back without
+// a restart, so a success has to clear a recorded failure.
+func TestTSDB_PingRecoversWhenFsyncStartsWorking(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	db.recordSync(errors.New("no space left on device"))
+	if db.Ping(t.Context()) == nil {
+		t.Fatal("Ping ignores a recorded fsync failure")
+	}
+
+	db.recordSync(nil)
+	if err := db.Ping(t.Context()); err != nil {
+		t.Errorf("Ping still failing after a successful fsync: %v", err)
+	}
+}
+
+// Ping answers the readiness probe every few seconds. It must not fsync (that
+// would be write amplification driven by a health check) and it must not block
+// behind a writer.
+func TestTSDB_PingDoesNotWaitForWriters(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Ping(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Ping: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ping blocked behind a writer holding the database lock")
 	}
 }

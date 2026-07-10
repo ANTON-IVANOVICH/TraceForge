@@ -1,0 +1,524 @@
+{
+  "uid": "traceforge-agents",
+  "title": "TraceForge \u2014 Agents",
+  "tags": [
+    "traceforge"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Agents reporting",
+      "description": "Distinct agents currently scraped. A drop means an agent went silent.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "count(traceforge_agent_build_info)",
+          "range": false,
+          "instant": true,
+          "refId": "A",
+          "legendFormat": "agents"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Collect failure rate",
+      "description": "Collector errors per second across all agents. See the note below: this is what makes a silently-broken agent visible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_agent_collect_failures_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "fails/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.0001
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Send failure rate",
+      "description": "Failed batch deliveries to the server per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_agent_send_failures_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "fails/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.0001
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Collected metrics rate",
+      "description": "Metrics gathered per second across the fleet.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_agent_collected_metrics_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "metrics/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "text",
+      "title": "Why the failure counter matters",
+      "datasource": null,
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "An agent whose collectors **all** fail keeps running, keeps ticking, keeps sending empty batches \u2014 and from the outside it still looks healthy. `traceforge_agent_collect_failures_total` is the signal that turns that silent failure into something you can alert on. Watch it, not just liveness."
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Collected metrics per agent",
+      "description": "Per-agent collection throughput. A line dropping to zero while the agent still reports is the collectors-all-failing case.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum by (id) (rate(traceforge_agent_collected_metrics_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "{{id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Failures per agent (collect + send)",
+      "description": "Collect vs send failures broken out per agent.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum by (id) (rate(traceforge_agent_collect_failures_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "collect {{id}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum by (id) (rate(traceforge_agent_send_failures_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "B",
+          "legendFormat": "send {{id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Staleness \u2014 seconds since last successful collect",
+      "description": "time() minus the last collect timestamp, per instance. A large or growing value means the agent has stopped collecting even if it is still up.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "time() - traceforge_agent_last_collect_timestamp_seconds",
+          "range": false,
+          "instant": true,
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "__name__": true
+            },
+            "renameByName": {
+              "instance": "instance",
+              "id": "agent",
+              "Value": "stale (s)"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "align": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "stale (s)"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "stale (s)",
+            "desc": true
+          }
+        ]
+      }
+    }
+  ]
+}

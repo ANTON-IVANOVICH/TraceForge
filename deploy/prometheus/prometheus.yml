@@ -1,0 +1,29 @@
+# Scrape config for the compose stack. In Kubernetes the same job is expressed as
+# a ServiceMonitor (see the Helm chart) or by the pod annotations that a
+# kubernetes_sd_config scrape job reads.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: compose
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # Everything TraceForge exports lives on the telemetry port, never on the API
+  # port. Scraping :8080 would find nothing, which is the intended answer.
+  - job_name: traceforge-server
+    static_configs:
+      - targets: ["server:9091"]
+
+  - job_name: traceforge-agent
+    static_configs:
+      - targets: ["agent:9101"]
+
+  # Prometheus scraping itself. Not vanity: if this target is down, every other
+  # "target is down" alert is unreliable, because the thing that would fire it is
+  # the thing that is broken.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,17 @@
+# Provisioned Prometheus datasource for the TraceForge dashboards.
+# The uid is fixed on purpose: every panel target references "traceforge-prom",
+# so a mismatch here is what makes a freshly imported dashboard show "No data".
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: traceforge-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      # Match the server's default scrape interval so rate() windows line up.
+      timeInterval: 15s

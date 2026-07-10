@@ -1,0 +1,16 @@
+# Patterns here are excluded from the packaged .tgz. They keep editor cruft,
+# CI scratch and the chart's own rendered output from ever shipping to a
+# registry — a packaged chart should contain only the templates and defaults.
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+*.bak
+*.orig
+*.swp
+.idea/
+.vscode/
+*.tgz
+# Rendered manifests and local overrides never belong in the package.
+rendered/
+values-local.yaml

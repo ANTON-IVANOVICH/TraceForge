@@ -1,13 +1,37 @@
 .PHONY: tidy build test vet lint lint-install run-server run-agent run-ctl proto proto-tools install-ctl \
 	test-unit test-integration test-e2e test-all cover cover-html fuzz fuzz-long bench bench-save bench-compare \
-	mutate profile-cpu profile-heap profile-trace tools build-nocgo cross-nocgo cross-cgo test-nocgo
+	mutate profile-cpu profile-heap profile-trace tools build-nocgo cross-nocgo cross-cgo test-nocgo \
+	docker docker-server docker-agent docker-agent-pcap docker-multiarch docker-smoke \
+	compose-up compose-down manifests manifests-check helm-lint helm-template kubeconform deploy-check \
+	vuln sbom scan promtool-check release-check release-snapshot
 
 GOBIN := $(shell go env GOPATH)/bin
 
-# Version reported by `metricsctl version`, taken from the SemVer tag when there
-# is one. -s -w drops the symbol table and DWARF info, shrinking the binary.
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.version=$(VERSION)
+# The build's identity, injected into internal/buildinfo. Every binary reports it
+# through -version, and the server exports it as traceforge_build_info so that
+# `count by (version) (traceforge_build_info)` shows how far a rollout has got.
+#
+# The commit and date have a fallback the ldflags cannot reach: `go build` and
+# `go install` of a main package stamp vcs.revision, vcs.time and vcs.modified
+# into the binary when the source sits in a work tree and `git` is on PATH. So
+# `go build -o bin/server ./cmd/server` with no flags at all still knows its commit.
+#
+# `go test` and `go run` do not: a test binary is never VCS-stamped, and `go run`
+# reports "dev (unknown, unknown, ...)". That is why nothing in the test suite may
+# assert on the real build's identity, and why internal/buildinfo has a placeholder
+# for every field.
+#
+# -s -w drops the symbol table and DWARF info, shrinking the binary by about a
+# third at the cost of being able to attach delve to it.
+VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT    ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+BUILDINFO := metrics-system/internal/buildinfo
+LDFLAGS := -s -w \
+	-X $(BUILDINFO).version=$(VERSION) \
+	-X $(BUILDINFO).commit=$(COMMIT) \
+	-X $(BUILDINFO).date=$(BUILD_DATE)
 
 # -count=1 disables Go's test result cache. The cache is a fine default locally
 # and a liability everywhere else: it hides flakes, which are exactly the tests
@@ -242,6 +266,151 @@ profile-trace:
 	@mkdir -p $(PROFDIR)
 	go test -run=XXX -bench='$(PROF_BENCH)' -benchtime=3s -trace=$(PROFDIR)/trace.out $(PROF_PKG)
 	go tool trace $(PROFDIR)/trace.out
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Containers.
+#
+# One Dockerfile, four targets. The pure-Go ones cross-compile in seconds because
+# the builder stage is pinned to $BUILDPLATFORM; the libpcap one cannot, and runs
+# under emulation. Read deploy/docker/Dockerfile before changing any of this.
+# ---------------------------------------------------------------------------
+
+DOCKERFILE  := deploy/docker/Dockerfile
+IMAGE_PREFIX ?= traceforge
+TAG         ?= $(VERSION)
+BUILD_ARGS  := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE)
+
+docker: docker-server docker-agent
+
+docker-server:
+	docker buildx build -f $(DOCKERFILE) --target server $(BUILD_ARGS) \
+		-t $(IMAGE_PREFIX)/server:$(TAG) --load .
+
+docker-agent:
+	docker buildx build -f $(DOCKERFILE) --target agent $(BUILD_ARGS) \
+		-t $(IMAGE_PREFIX)/agent:$(TAG) --load .
+
+# The CGo image. Slow, and deliberately separate: it runs as root because raw
+# sockets need CAP_NET_RAW, which a non-root process cannot receive from the
+# container runtime alone.
+docker-agent-pcap:
+	docker buildx build -f $(DOCKERFILE) --target agent-pcap $(BUILD_ARGS) \
+		-t $(IMAGE_PREFIX)/agent-pcap:$(TAG) --load .
+
+# `--load` cannot take a manifest list, so a multi-arch build stays in the cache
+# unless it is pushed. This target proves it builds; the release workflow pushes.
+docker-multiarch:
+	docker buildx build -f $(DOCKERFILE) --target server --platform linux/amd64,linux/arm64 $(BUILD_ARGS) .
+	docker buildx build -f $(DOCKERFILE) --target agent  --platform linux/amd64,linux/arm64 $(BUILD_ARGS) .
+
+# What CI runs after building: the image starts, reports its version, and its own
+# health check agrees with it.
+docker-smoke: docker-server
+	docker run --rm $(IMAGE_PREFIX)/server:$(TAG) -version
+	@id=$$(docker run -d --rm -p 19091:9091 $(IMAGE_PREFIX)/server:$(TAG) -storage=memory -ui=false); \
+	trap "docker stop $$id >/dev/null" EXIT; \
+	for i in $$(seq 40); do \
+		if curl -sf http://127.0.0.1:19091/readyz >/dev/null; then echo "readyz ok"; break; fi; \
+		sleep 0.5; \
+	done; \
+	curl -sf http://127.0.0.1:19091/metrics | head -3; \
+	docker exec $$id /usr/local/bin/server -health-check && echo "in-container health check ok"
+
+compose-up:
+	VERSION=$(VERSION) COMMIT=$(COMMIT) BUILD_DATE=$(BUILD_DATE) \
+		docker compose -f deploy/compose.yaml --profile observability up -d --build
+
+compose-down:
+	docker compose -f deploy/compose.yaml --profile observability down -v
+
+# ---------------------------------------------------------------------------
+# Kubernetes. The chart is the source of truth; deploy/k8s is rendered from it and
+# committed so an operator without helm can apply it — and so the Go tests in
+# test/deploy can read the exact bytes that reach a cluster.
+# ---------------------------------------------------------------------------
+
+CHART := deploy/charts/traceforge
+
+manifests:
+	@mkdir -p deploy/k8s
+	@{ \
+		echo "# Generated by 'make manifests' from $(CHART) with values-prod.yaml."; \
+		echo "# Do not edit. The chart is the source of truth; CI fails if this file is stale."; \
+		echo "#"; \
+		echo "# It is committed so that an operator without helm can 'kubectl apply -f', and so"; \
+		echo "# that the Go tests in test/deploy can check the security posture and the flags of"; \
+		echo "# manifests that are otherwise only YAML nobody executes."; \
+		echo "---"; \
+		helm template traceforge $(CHART) --namespace traceforge \
+			-f $(CHART)/values-prod.yaml --set metrics.serviceMonitor.enabled=false; \
+	} > deploy/k8s/traceforge.yaml
+	@echo "wrote deploy/k8s/traceforge.yaml"
+
+# The drift check. A rendered file that nobody regenerates is a rendered file that
+# lies about the chart it came from.
+manifests-check: manifests
+	@git diff --exit-code -- deploy/k8s || { \
+		echo "deploy/k8s is stale; run 'make manifests' and commit the result"; exit 1; }
+
+helm-lint:
+	helm lint $(CHART)
+	helm lint $(CHART) -f $(CHART)/values-prod.yaml
+
+helm-template:
+	helm template traceforge $(CHART) -f $(CHART)/values-prod.yaml
+
+kubeconform:
+	helm template traceforge $(CHART) | kubeconform -strict -summary -ignore-missing-schemas -
+	helm template traceforge $(CHART) -f $(CHART)/values-prod.yaml | kubeconform -strict -summary -ignore-missing-schemas -
+	helm template traceforge $(CHART) --set agent.capture.enabled=true | kubeconform -strict -summary -ignore-missing-schemas -
+
+# `promtool check metrics` is an external oracle for the exposition format this
+# repo writes by hand (internal/promexport). It reads the format's own spec, and
+# it does not care what wrote the bytes.
+promtool-check:
+	@go run ./cmd/server -addr=127.0.0.1:0 -grpc-addr= -telemetry-addr=127.0.0.1:19099 -ui=false & \
+		srv=$$!; \
+		trap "kill $$srv 2>/dev/null" EXIT; \
+		until curl -sf http://127.0.0.1:19099/healthz >/dev/null; do sleep 0.2; done; \
+		curl -s http://127.0.0.1:19099/metrics | \
+			docker run --rm -i --entrypoint /bin/promtool prom/prometheus:latest check metrics
+	docker run --rm -v "$(CURDIR)/deploy/prometheus:/etc/prometheus:ro" \
+		--entrypoint /bin/promtool prom/prometheus:latest check config /etc/prometheus/prometheus.yml
+
+deploy-check: helm-lint kubeconform manifests-check
+	go test -count=1 ./test/deploy/...
+
+# ---------------------------------------------------------------------------
+# Supply chain.
+# ---------------------------------------------------------------------------
+
+# govulncheck is not a CVE scanner. It walks the call graph, so a vulnerable
+# function in a dependency you never call is reported as informational rather
+# than as a fire. That is the difference between a tool people run and a tool
+# people mute.
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+# Syft and Trivy run from their own images: neither belongs on a developer's PATH,
+# and pinning them here means CI and the laptop scan with the same version.
+sbom: docker-server
+	docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+		anchore/syft:latest $(IMAGE_PREFIX)/server:$(TAG) -o spdx-json=/dev/stdout | head -5
+	@echo "(full SBOM: docker run ... syft ... -o spdx-json > sbom.json)"
+
+scan: docker-server
+	docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+		aquasec/trivy:latest image --severity HIGH,CRITICAL --exit-code 1 \
+		$(IMAGE_PREFIX)/server:$(TAG)
+
+release-check:
+	goreleaser check
+
+# Builds everything a real release would, publishes nothing.
+release-snapshot:
+	goreleaser release --snapshot --clean --skip=sign,sbom
 
 # ---------------------------------------------------------------------------
 

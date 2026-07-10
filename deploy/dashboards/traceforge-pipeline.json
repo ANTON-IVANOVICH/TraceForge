@@ -1,0 +1,575 @@
+{
+  "uid": "traceforge-pipeline",
+  "title": "TraceForge \u2014 Pipeline",
+  "tags": [
+    "traceforge"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "The accounting identity",
+      "datasource": null,
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**ingested == stored + invalid + failed**  (once the pipeline has drained)  \n**offered == ingested + dropped**  (always)\n\n`dropped` is backpressure the caller *was told about*. `failed` is data the caller was told we accepted (202) and then **lost** to a storage write error \u2014 the one line on this board that should always be flat at zero."
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Ingest rate",
+      "description": "Accepted-and-validated points entering the pipeline per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_ingested_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "ingested/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "ACCEPTED THEN LOST",
+      "description": "Points the caller was told (202) we stored, then lost to a write error. Any non-zero value is real data loss.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_failed_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "failed/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.0001
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Dropped (backpressure)",
+      "description": "Refused at the door when the ingest buffer was full. The caller was told \u2014 this is honest backpressure, not loss.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_dropped_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "dropped/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Rate-limiter buckets",
+      "description": "Live token buckets tracked by the rate limiter.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "traceforge_ratelimit_buckets",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Fate of ingested points (stored + invalid + failed)",
+      "description": "Stacked, these three rates must sum to the ingest rate once the pipeline has drained. A visible gap means points are still in flight.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_stored_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "stored"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_invalid_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "B",
+          "legendFormat": "invalid"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_failed_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "C",
+          "legendFormat": "failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Ingested vs dropped (offered)",
+      "description": "Their sum is what callers offered. dropped rising while ingested plateaus is the buffer saturating.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_ingested_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "ingested"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traceforge_pipeline_dropped_total[5m]))",
+          "range": true,
+          "instant": false,
+          "refId": "B",
+          "legendFormat": "dropped"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage series",
+      "description": "Distinct time series held by the storage backend.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "traceforge_storage_series",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage points",
+      "description": "Total samples held by the storage backend.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "traceforge-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "traceforge-prom"
+          },
+          "editorMode": "code",
+          "expr": "traceforge_storage_points",
+          "range": true,
+          "instant": false,
+          "refId": "A",
+          "legendFormat": "points"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

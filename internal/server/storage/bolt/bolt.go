@@ -6,6 +6,7 @@ package bolt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -177,6 +178,28 @@ func (s *Storage) Stats() storage.Stats {
 		})
 	})
 	return st
+}
+
+// Ping opens a read transaction and checks the root buckets are still there.
+//
+// A read transaction is the right probe for bbolt precisely because it is not a
+// write one: readers take a snapshot of the meta page and never queue behind the
+// single writer, so this stays fast under load. What it proves is narrow and
+// worth having — the file is open, the mmap is valid, and the database is still
+// the shape we opened. It cannot prove the next write will land; nothing cheap
+// can.
+func (s *Storage) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.db.View(func(tx *bbolt.Tx) error {
+		for _, name := range [][]byte{bucketMeta, bucketPoints} {
+			if tx.Bucket(name) == nil {
+				return fmt.Errorf("bucket %q missing", name)
+			}
+		}
+		return nil
+	})
 }
 
 // Close closes the database (releasing its file lock).

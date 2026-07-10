@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"metrics-system/internal/buildinfo"
 	"metrics-system/internal/cli/client"
 	"metrics-system/internal/cli/config"
 	"metrics-system/internal/cli/output"
@@ -39,8 +40,10 @@ type Options struct {
 	Stdin  io.Reader
 }
 
-// NewRootCmd assembles the command tree.
-func NewRootCmd(version string, opts *Options) *cobra.Command {
+// NewRootCmd assembles the command tree. build is the running binary's identity,
+// resolved once in main and passed down rather than read from a global here, so a
+// test can assemble a root command with a build of its choosing.
+func NewRootCmd(build buildinfo.Info, opts *Options) *cobra.Command {
 	if opts == nil {
 		opts = &Options{}
 	}
@@ -131,7 +134,7 @@ Examples:
 		newStatsCmd(),
 		newConfigCmd(),
 		newCompletionCmd(),
-		newVersionCmd(version),
+		newVersionCmd(build),
 	)
 	return cmd
 }

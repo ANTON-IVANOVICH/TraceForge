@@ -1,0 +1,66 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- $svc := .Values.server -}}
+{{/*
+A hostNetwork pod is not, for policy purposes, a pod. Its packets carry the node's
+IP and none of its labels, so `from: podSelector` never matches it. Capture needs
+hostNetwork — a raw socket in the pod's own netns sees a veth and nothing else — so
+enabling capture behind an enforcing CNI silently breaks ingest from every node
+until the node addresses are admitted explicitly.
+
+Silently is the operative word: the agent keeps collecting, the server keeps
+serving, and the metrics simply stop arriving. Rather than let that happen, the
+render fails.
+*/}}
+{{- if and .Values.agent.enabled .Values.agent.capture.enabled (not .Values.networkPolicy.nodeCIDRs) }}
+{{- fail "networkPolicy.enabled and agent.capture.enabled are both set, but networkPolicy.nodeCIDRs is empty. A capture agent runs with hostNetwork, so its traffic arrives from the node's IP and no podSelector can match it. Set networkPolicy.nodeCIDRs to your node CIDRs (e.g. [\"10.0.0.0/16\"]), or disable one of the two." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "traceforge.server.fullname" . }}
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  # Default-deny to the server: an empty ingress rule set would deny everything;
+  # we instead deny-by-default and then re-open exactly three paths below. A
+  # policyType of Ingress with the rules listed means anything not matched is
+  # dropped by an enforcing CNI (a CNI that ignores NetworkPolicy no-ops this).
+  podSelector:
+    matchLabels:
+      {{- include "traceforge.server.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Ingest: the agents (and only the agents) may reach HTTP and gRPC.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "traceforge.agent.selectorLabels" . | nindent 14 }}
+        {{- range .Values.networkPolicy.nodeCIDRs }}
+        # A capture agent runs with hostNetwork and therefore arrives from a node
+        # address, not a pod one. This widens ingest to every node in the cluster,
+        # which is the price of running a DaemonSet in the host's network namespace;
+        # narrow the CIDRs if the nodes that run agents are a known subset.
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $svc.http.port }}
+        {{- if $svc.grpc.enabled }}
+        - protocol: TCP
+          port: {{ $svc.grpc.port }}
+        {{- end }}
+    # Telemetry: scraping is allowed ONLY from the monitoring namespace, so the
+    # probes/metrics port is not reachable from arbitrary workloads. This relies
+    # on the monitoring namespace carrying kubernetes.io/metadata.name (set by the
+    # apiserver automatically on every namespace since 1.22).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ $svc.telemetry.port }}
+{{- end }}

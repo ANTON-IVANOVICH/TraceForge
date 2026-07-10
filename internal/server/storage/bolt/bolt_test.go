@@ -1,9 +1,13 @@
 package bolt
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"go.etcd.io/bbolt"
 
 	"metrics-system/internal/model"
 	"metrics-system/internal/server/storage"
@@ -114,5 +118,79 @@ func TestBoltStorage_LabelFilterAndStats(t *testing.T) {
 	}
 	if st := s.Stats(); st.Series != 2 || st.Points != 2 {
 		t.Errorf("stats = %+v, want series=2 points=2", st)
+	}
+}
+
+// Ping is what the readiness probe calls. It has to distinguish a database that
+// is open and whole from one that is not, and it has to do so without a write.
+func TestBoltStorage_Ping(t *testing.T) {
+	s, err := New(filepath.Join(t.TempDir(), "ping.bolt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ping(context.Background()); err != nil {
+		t.Errorf("Ping on an open database: %v", err)
+	}
+
+	// A closed database is the state a probe must catch: bbolt refuses every
+	// transaction, and nothing else in the process would notice until the next
+	// write.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ping(context.Background()); err == nil {
+		t.Error("Ping reports a closed database as healthy")
+	}
+}
+
+// Readers in bbolt take a snapshot of the meta page and never queue behind the
+// single writer. That property is the whole reason Ping uses a View transaction,
+// so it is worth pinning: a probe that waits for a slow write is a probe that
+// fails a healthy replica under load.
+func TestBoltStorage_PingDoesNotWaitForTheWriter(t *testing.T) {
+	s, err := New(filepath.Join(t.TempDir(), "ping-writer.bolt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	writing := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = s.db.Update(func(*bbolt.Tx) error {
+			close(writing)
+			<-release
+			return nil
+		})
+	}()
+	<-writing
+	defer close(release)
+
+	done := make(chan error, 1)
+	go func() { done <- s.Ping(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Ping: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ping blocked behind an open write transaction")
+	}
+}
+
+// The context is the probe's deadline. A Ping that ignores it would keep the
+// prober's goroutine alive past the round it belongs to.
+func TestBoltStorage_PingHonoursContext(t *testing.T) {
+	s, err := New(filepath.Join(t.TempDir(), "ping-ctx.bolt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Ping(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Ping with a cancelled context = %v, want context.Canceled", err)
 	}
 }

@@ -1,0 +1,170 @@
+# Alerts on TraceForge itself.
+#
+# Two rules govern what is here. Every alert must be actionable — if the on-call
+# response is "wait and see", it is a dashboard panel, not a page. And every alert
+# links a runbook, because the person woken at 03:00 is usually not the person who
+# wrote the rule.
+#
+# The runbook_url values point at docs/runbooks/, and a test in test/deploy checks
+# that each named file exists. A link that 404s at 03:00 is worse than no link.
+#
+# Validated by `promtool check rules deploy/prometheus/alerts.yml` in CI.
+
+groups:
+  - name: traceforge-availability
+    rules:
+      - alert: TraceForgeServerDown
+        expr: up{job="traceforge-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TraceForge server {{ $labels.instance }} is not answering scrapes"
+          description: >-
+            Prometheus has been unable to scrape the telemetry port for two minutes.
+            Ingest may still be working — the API and the telemetry listener are
+            different ports — so check both before assuming an outage.
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeServerDown.md"
+
+  - name: traceforge-data-loss
+    rules:
+      # The one that matters most, and the quietest. A metric that passed
+      # validation and then failed to be written was answered with 202: the agent
+      # believes it was accepted, nothing retries it, and the only trace is this
+      # counter. See internal/server/pipeline/stats.go.
+      - alert: TraceForgeStorageWritesFailing
+        expr: rate(traceforge_pipeline_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TraceForge is losing metrics it told agents it had accepted"
+          description: >-
+            {{ $value | printf "%.2f" }} metrics/s failed to be written to storage
+            over the last five minutes. These were accepted with 202 and are gone.
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeStorageWritesFailing.md"
+
+      # Backpressure. Unlike the above, the agent was told: Ingest returned false
+      # and the caller got a 429. Data is lost, but nobody was lied to.
+      - alert: TraceForgePipelineDropping
+        expr: rate(traceforge_pipeline_dropped_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TraceForge is shedding load at the ingest door"
+          description: >-
+            {{ $value | printf "%.2f" }} metrics/s refused because the pipeline
+            buffer was full. The store stage is the usual bottleneck.
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgePipelineDropping.md"
+
+  - name: traceforge-api
+    rules:
+      - alert: TraceForgeHighErrorRate
+        expr: |
+          sum(rate(traceforge_http_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(traceforge_http_requests_total[5m]))
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of TraceForge HTTP requests are failing"
+          description: "{{ $value | humanizePercentage }} of requests returned 5xx over five minutes."
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeHighErrorRate.md"
+
+      # histogram_quantile over buckets, not a summary's precomputed quantile.
+      # Buckets add across replicas; a p99 does not, which is why this server
+      # exports a histogram and no summary at all.
+      - alert: TraceForgeHighLatency
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, route) (rate(traceforge_http_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TraceForge p99 latency on {{ $labels.route }} is above one second"
+          description: "p99 = {{ $value | printf \"%.3f\" }}s over five minutes."
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeHighLatency.md"
+
+  - name: traceforge-runtime
+    rules:
+      # GOMEMLIMIT is a soft limit: crossing it makes the GC run harder, it does
+      # not kill anything. Sitting above 90% of it means the GC is already
+      # spending CPU it would rather spend on requests, and the cgroup's hard
+      # limit — which counts mmap'd chunk files that GOMEMLIMIT does not — is not
+      # far behind.
+      - alert: TraceForgeNearMemoryLimit
+        expr: |
+          traceforge_go_memory_total_bytes
+            /
+          (traceforge_go_memory_limit_bytes < 9e18)
+            > 0.9
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TraceForge {{ $labels.instance }} is within 10% of GOMEMLIMIT"
+          description: >-
+            The Go runtime is holding {{ $value | humanizePercentage }} of its soft
+            memory limit. Note that mmap'd chunk files are counted by the cgroup and
+            not by GOMEMLIMIT, so the real headroom is smaller than this number.
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeNearMemoryLimit.md"
+
+      # The rate limiter keys buckets by agent id. A client inventing a new id per
+      # request grows this without bound until the sweeper's cap stops it — which
+      # is a denial of service that looks like normal traffic.
+      - alert: TraceForgeRateLimiterBucketsHigh
+        expr: traceforge_ratelimit_buckets > 50000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TraceForge is tracking an implausible number of agents"
+          description: "{{ $value }} live rate-limit buckets. Check for a client sending a fresh X-Agent-ID per request."
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeRateLimiterBucketsHigh.md"
+
+  - name: traceforge-agent
+    rules:
+      # An agent whose collectors all fail keeps running, keeps logging at warn,
+      # and keeps sending nothing. Nothing turns red. This is that alert.
+      - alert: TraceForgeAgentCollectorsFailing
+        expr: rate(traceforge_agent_collect_failures_total[10m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A TraceForge agent's collectors are failing on {{ $labels.instance }}"
+          description: "{{ $value | printf \"%.2f\" }} collector errors/s over ten minutes."
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeAgentCollectorsFailing.md"
+
+      # The agent omits this gauge entirely until its first successful collection,
+      # so `absent()` catches a freshly started agent that has never worked, and the
+      # staleness comparison catches one that has stopped.
+      - alert: TraceForgeAgentStale
+        expr: time() - traceforge_agent_last_collect_timestamp_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TraceForge agent {{ $labels.instance }} has not collected in two minutes"
+          description: "The agent process is up and scrapeable, but no tick has produced a metric."
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeAgentStale.md"
+
+      - alert: TraceForgeAgentCannotReachServer
+        expr: rate(traceforge_agent_send_failures_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TraceForge agent {{ $labels.instance }} cannot deliver batches"
+          description: >-
+            The agent is collecting but its transport is failing. Note that the
+            agent's own readiness probe stays green on purpose — a DaemonSet whose
+            readiness tracked the server would stall every rollout during a server
+            outage, which is when you most need to deploy.
+          runbook_url: "https://github.com/ANTON-IVANOVICH/TraceForge/blob/main/docs/runbooks/TraceForgeAgentCannotReachServer.md"

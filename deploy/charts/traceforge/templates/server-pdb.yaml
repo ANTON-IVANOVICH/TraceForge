@@ -1,0 +1,18 @@
+{{- if .Values.server.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "traceforge.server.fullname" . }}
+  labels:
+    {{- include "traceforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  # maxUnavailable, not minAvailable: with a single replica, minAvailable:1 would
+  # pin the pod and BLOCK every voluntary node drain forever. maxUnavailable:1
+  # instead lets a drain evict the pod (it reschedules with its PVC) while still
+  # protecting against an involuntary budget breach when replicas>1.
+  maxUnavailable: {{ .Values.server.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "traceforge.server.selectorLabels" . | nindent 6 }}
+{{- end }}

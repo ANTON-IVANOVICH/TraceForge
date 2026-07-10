@@ -1,0 +1,180 @@
+version: 2
+
+# GoReleaser turns `git tag v0.11.0 && git push --tags` into archives for four
+# platforms, container images for two architectures, an SBOM per artefact, and a
+# Sigstore signature over all of it.
+#
+# Run `goreleaser check` to validate this file and
+# `goreleaser release --snapshot --clean` to build everything without publishing.
+# Both run in CI, so a broken release config fails on the pull request rather than
+# on the tag.
+
+project_name: traceforge
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod verify
+
+builds:
+  # CGO_ENABLED=0 everywhere. The packet-capture collector needs libpcap, and a
+  # binding to a C library is exactly what makes cross-compilation stop working:
+  # cgo needs a C toolchain and headers for the *target*, and there is no such
+  # thing as one toolchain for four platforms. The pure-Go agent still runs on
+  # every platform; it reports that capture is unavailable and collects everything
+  # else. The libpcap build ships as a container image instead, where the build
+  # can happen on the target architecture.
+  #
+  # See internal/agent/network and `make cross-cgo`, which fails on purpose.
+  - id: server
+    main: ./cmd/server
+    binary: traceforge-server
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: &ldflags
+      - -s -w
+      - -X metrics-system/internal/buildinfo.version={{ .Version }}
+      - -X metrics-system/internal/buildinfo.commit={{ .FullCommit }}
+      - -X metrics-system/internal/buildinfo.date={{ .CommitDate }}
+    # The commit's date, not the build's. A release rebuilt tomorrow from the same
+    # tag must produce the same bytes, and `time.Now()` is the usual reason it does
+    # not. See `mod_timestamp` below for the archive side of the same rule.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  - id: agent
+    main: ./cmd/agent
+    binary: traceforge-agent
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: *ldflags
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  - id: metricsctl
+    main: ./cmd/metricsctl
+    binary: metricsctl
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: *ldflags
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# Two archives, not one, and the reason is a constraint GoReleaser enforces for
+# good reason: an archive must contain the same binaries on every platform, or the
+# person who downloads the Windows one and the person who downloads the Linux one
+# are holding different products under the same name.
+#
+# metricsctl runs on Windows. The server and the agent do not — they are built for
+# linux and darwin only, because an operator running this system on Windows is a
+# scenario nobody has, and shipping an untested binary to satisfy a matrix is how
+# you get a bug report from the one person who tries it.
+archives:
+  - id: node
+    ids: [server, agent]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    # No LICENSE glob: this repository does not carry one yet, and GoReleaser
+    # silently skips a missing file rather than failing, which is how a release
+    # ships without the licence it claims.
+    files:
+      - README.md
+      - CHANGELOG.md
+
+  - id: cli
+    ids: [metricsctl]
+    name_template: >-
+      metricsctl_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+# An SBOM per archive, in SPDX. Its job is not to be read: it is to be searchable
+# on the day a CVE lands in a transitive dependency, so that "which of our
+# releases contains it" is a query rather than an archaeology project.
+sboms:
+  - artifacts: archive
+
+# Keyless signing through Sigstore. There is no private key to store, rotate or
+# leak: the identity comes from the GitHub Actions OIDC token, and the signature
+# is recorded in Rekor's public transparency log. Verification then asks two
+# questions — was this signed by that workflow, in that repository — and neither
+# has a secret in it.
+#
+#   cosign verify-blob --signature checksums.txt.sig \
+#     --certificate checksums.txt.pem \
+#     --certificate-identity-regexp 'https://github.com/ANTON-IVANOVICH/TraceForge/.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     checksums.txt
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+  groups:
+    - title: Features
+      regexp: '^feat(\(.+\))?!?:'
+      order: 0
+    - title: Fixes
+      regexp: '^fix(\(.+\))?!?:'
+      order: 1
+    - title: Performance
+      regexp: '^perf(\(.+\))?!?:'
+      order: 2
+    - title: Other
+      order: 99
+
+release:
+  github:
+    owner: ANTON-IVANOVICH
+    name: TraceForge
+  draft: false
+  # A tag like v0.11.0-rc.1 becomes a pre-release without anyone remembering to
+  # tick the box.
+  prerelease: auto
+  footer: |
+    ## Container images
+
+    Images are built and pushed by the release workflow, not by GoReleaser: the
+    packet-capture agent links against libpcap and must be compiled on the target
+    architecture, which `docker buildx` handles and a cross-compiling GoReleaser
+    build cannot.
+
+    ## Verifying this release
+
+    ```
+    cosign verify-blob \
+      --signature checksums.txt.sig \
+      --certificate checksums.txt.pem \
+      --certificate-identity-regexp 'https://github.com/ANTON-IVANOVICH/TraceForge/.*' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      checksums.txt
+    sha256sum -c checksums.txt --ignore-missing
+    ```
