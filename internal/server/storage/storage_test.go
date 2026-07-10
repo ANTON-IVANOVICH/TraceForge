@@ -13,7 +13,7 @@ func TestMemoryStorage_WriteQueryRaw(t *testing.T) {
 	s := NewMemoryStorage()
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < 3; i++ {
-		s.Write(model.Metric{
+		_ = s.Write(model.Metric{
 			Name:      "cpu",
 			Type:      model.MetricTypeGauge,
 			Value:     float64(i),
@@ -40,8 +40,8 @@ func TestMemoryStorage_WriteQueryRaw(t *testing.T) {
 func TestMemoryStorage_LabelFilter(t *testing.T) {
 	s := NewMemoryStorage()
 	now := time.Now()
-	s.Write(model.Metric{Name: "cpu", Type: model.MetricTypeGauge, Value: 1, Timestamp: now, Labels: map[string]string{"host": "a"}})
-	s.Write(model.Metric{Name: "cpu", Type: model.MetricTypeGauge, Value: 2, Timestamp: now, Labels: map[string]string{"host": "b"}})
+	_ = s.Write(model.Metric{Name: "cpu", Type: model.MetricTypeGauge, Value: 1, Timestamp: now, Labels: map[string]string{"host": "a"}})
+	_ = s.Write(model.Metric{Name: "cpu", Type: model.MetricTypeGauge, Value: 2, Timestamp: now, Labels: map[string]string{"host": "b"}})
 
 	got, _ := s.Query(Query{Name: "cpu", Labels: map[string]string{"host": "b"}})
 	if len(got) != 1 || got[0].Value != 2 {
@@ -56,7 +56,7 @@ func TestMemoryStorage_Aggregation(t *testing.T) {
 	s := NewMemoryStorage()
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i, v := range []float64{10, 20, 30, 40} {
-		s.Write(model.Metric{Name: "cpu", Type: model.MetricTypeGauge, Value: v, Timestamp: base.Add(time.Duration(i) * time.Second)})
+		_ = s.Write(model.Metric{Name: "cpu", Type: model.MetricTypeGauge, Value: v, Timestamp: base.Add(time.Duration(i) * time.Second)})
 	}
 
 	got, err := s.Query(Query{Name: "cpu", Aggregator: avgAgg{}, From: base, To: base.Add(time.Hour), Step: time.Hour})
