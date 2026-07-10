@@ -4,7 +4,7 @@ How the system is put together: components, data flow, the concurrency model,
 storage internals, and the design decisions behind them. Kept in sync with the
 staged roadmap.
 
-- **Covers up to:** v0.9.0 (testing, benchmarking & profiling)
+- **Covers up to:** v0.10.0 (CGo: libpcap binding, and the alternatives to it)
 - **Last updated:** 2026-07-09
 - Go module: `metrics-system`. Three binaries: `agent`, `server`, `metricsctl`.
 
@@ -351,6 +351,90 @@ cmd/metricsctl ─▶ cli.NewRootCmd ─▶ PersistentPreRunE: setup()
   are not: a hand-written aligner and loader and plain prompts do the same work
   with less surface, in keeping with the rest of the project.
 
+## 4d. The CGo boundary (`internal/agent/network`)
+
+The agent's packet-capture collector is the only place this project leaves Go.
+It exists because there is no way to read frames off a live interface from pure
+Go without reimplementing BPF on every platform.
+
+```text
+  Go                         │  C
+  ───────────────────────────┼──────────────────────────────
+  Capture.Next()  ──────────▶│  tf_pcap_next  ──▶ pcap_next_ex
+       ◀── C.GoBytes(copy) ──│    (returns a pointer into
+                             │     libpcap's reusable buffer)
+                             │
+  Capture.Loop(fn) ─────────▶│  tf_pcap_loop  ──▶ pcap_loop
+  tfPacketHandler ◀──────────│    callback, keyed by an
+   (//export, cgo.Handle)    │    opaque integer handle
+```
+
+Four rules hold the boundary together, and each one is a bug the naive version
+has:
+
+1. **Ownership is explicit.** `C.CString` allocates in the C heap; every one is
+   freed. libpcap's packet pointer aims into a buffer it overwrites on the next
+   call, so every packet is copied with `C.GoBytes` — a test deletes that copy
+   and watches packet one turn into packet two.
+2. **Handle lifetime is a lock, not a hope.** `pcap_close` frees the handle. An
+   `RWMutex` lets readers hold it while inside C and makes `Close` wait for
+   them; `Close` calls `pcap_breakloop` first so a blocking read is interrupted
+   rather than waited on. A `runtime.AddCleanup` (not `SetFinalizer`, which can
+   resurrect its object) is the safety net for a caller who forgets.
+3. **C never holds a Go pointer.** The `pcap_loop` callback is found through an
+   opaque integer handle — `runtime/cgo.Handle`, which is the map-and-mutex
+   registry everyone hand-rolls, already in the standard library. A panic inside
+   the callback is recovered at the boundary, because unwinding through a C
+   stack frame is undefined behaviour.
+4. **The C lives in a `.c` file.** `struct pcap_pkthdr` embeds a
+   platform-dependent `timeval`, libpcap's headers carry unions cgo cannot
+   translate, and a Go file using `//export` may not *define* C functions in its
+   preamble.
+
+**Shape follows cost.** A CGo call is ~20ns against ~0.3ns for a Go call, so the
+shim returns a whole packet per call rather than a field per call. Everything
+that can be pure Go is: the link-layer and IP parsing (Ethernet, VLAN stacks,
+BSD/OpenBSD loopback, raw IP, Linux cooked capture, IPv6 extension chains) reads
+bytes chosen by whoever is on the network, and is fuzzed accordingly.
+
+**Push meets pull.** Capture is push-shaped; the agent's collector interface is
+pull-shaped. A background goroutine reads packets into atomics, and `Collect`
+merely snapshots them — so a quiet network never slows the agent's tick.
+
+### 4d.1 Build tags, and the tax CGo levies
+
+Taking a CGo dependency costs three things: `GOOS=linux GOARCH=arm64 go build`
+(the toolchain needs a C compiler and headers for the *target*), the static
+binary, and the ability to build on a host without libpcap. So capture sits
+behind `//go:build cgo`, with a stub behind `//go:build !cgo`, and
+`CGO_ENABLED=0` still produces a complete agent whose network collector reports
+itself unavailable. CI builds, vets and tests both — a build tag nobody
+exercises is a build tag that rots.
+
+### 4d.2 Why eBPF is documented and not shipped
+
+eBPF is the right tool for kernel-level metrics: a verified program runs in the
+kernel, counts events at nanosecond cost, and exposes a map user space reads.
+`cilium/ebpf` reaches it from pure Go (no libbpf, no CGo), which is what Cilium,
+Pixie and Pyroscope use.
+
+It is not in this repository because it could not be compiled or run where this
+stage was built: it needs Linux, `clang`, a generated `vmlinux.h`, and a kernel
+to attach a kprobe to. Committing several hundred lines of Linux-only Go and
+restricted C that has never been through a compiler would contradict the
+discipline v0.9.0 established. When it is worth its price — Linux ≥ 5.4, `CAP_BPF`
+or root, and a metric nothing else exposes — the shape is: a `SEC("kprobe/...")`
+program updating a `BPF_MAP_TYPE_ARRAY`, `bpf2go` generating the loader, and a
+collector that `Lookup`s the counter on each tick.
+
+`internal/agent/kernel` ships instead, and makes the stage's real point: TCP
+retransmits, resets, listen-queue overflows and UDP errors are already in
+`/proc/net/snmp` and `/proc/net/netstat`. No C, no dependency, no privilege, and
+it cross-compiles. **Check the alternative before you cross the border** — a pure
+Go port, a direct syscall via `golang.org/x/sys/unix`, a subprocess, or WASM.
+
+---
+
 ## 5. Configuration, logging, observability
 
 - **Config precedence:** defaults → environment variables → flags (both binaries).
@@ -375,6 +459,8 @@ cmd/{benchcmp,mutate}/      dev tools: significance-tested benchstat, mutation t
 internal/
   model/                    Metric, Batch, MetricType
   agent/                    collectors, HTTP + gRPC senders, orchestration
+    network/                libpcap binding (CGo) + pure-Go packet parser
+    kernel/                 /proc/net counters — the same metrics, no CGo
   auth/                     principal/RBAC, API keys, JWT (HS256/RS256), JWKS
   benchcmp/                 go test -bench parser + Mann-Whitney U test
   mutate/                   AST mutators + go test -overlay runner

@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-10
+
+CGo: the project leaves pure Go for the first time, to do something Go cannot —
+read packets off a live interface. The stage is as much about the *cost* of that
+border crossing as about the crossing itself, and about the discipline of asking
+whether it was necessary at all.
+
+### Added
+
+- `internal/agent/network`: a **libpcap binding** for the agent, and with it the
+  three hard parts of CGo done properly.
+  - **Memory ownership.** Every `C.CString` is paired with a `C.free`. Every
+    packet is copied out of libpcap's reusable receive buffer with `C.GoBytes`
+    before it is returned — a test deletes that copy and watches the first
+    packet turn into the second.
+  - **Handle lifetime.** `pcap_close` frees the handle for good, so an
+    `RWMutex` guards it: readers hold it while inside C, `Close` takes it for
+    writing and therefore cannot free a handle another goroutine is still in.
+    `Close` calls `pcap_breakloop` first, so a blocking read is interrupted
+    rather than waited on. A `runtime.AddCleanup` (not the legacy
+    `SetFinalizer`) is the safety net for a caller who forgets.
+  - **C→Go callbacks.** `pcap_loop` calls back into an `//export`ed Go
+    function. Handing C a Go pointer to give back later is what the cgo pointer
+    rules forbid, so the callback is found through an opaque integer handle —
+    `runtime/cgo.Handle`, which is the hand-rolled registry everyone writes,
+    already in the standard library. A panic in the callback is recovered at the
+    boundary, because unwinding through a C stack frame is undefined behaviour.
+- A **C shim** (`pcap_shim.c`/`.h`) rather than C in a Go comment: `struct
+  pcap_pkthdr` embeds a platform-dependent `timeval`, libpcap's headers carry
+  unions cgo cannot translate, and a file using `//export` may not define C
+  functions in its preamble.
+- A **link-layer aware packet parser**, pure Go: Ethernet (with stacked VLAN
+  tags), BSD loopback (`DLT_NULL`, whose address family is in the *writer's*
+  byte order), OpenBSD `DLT_LOOP`, raw IP, and Linux cooked capture. It walks
+  IPv6 extension headers, because a packet behind a hop-by-hop header does not
+  name its transport protocol in the fixed header — reading it there reports a
+  fleet full of protocol 0. Bounded against crafted VLAN and extension chains,
+  and fuzzed.
+- The **network collector**: a background capture goroutine feeding atomic
+  counters, so `Collect` is a snapshot read and never blocks the agent's tick.
+  Reports packets, bytes (wire length, not the truncated copy), per-protocol and
+  per-IP-version counts, unparsed frames, and — the metric that keeps the others
+  honest — **kernel drops** from `pcap_stats`, because under load the kernel
+  discards packets before this process ever sees them.
+- **`internal/agent/kernel`**: kernel network counters (TCP retransmits, resets,
+  listen-queue overflows, UDP errors) read straight from `/proc/net/snmp` and
+  `/proc/net/netstat` — **no CGo at all**. It is the stage's counterweight: the
+  metrics people reach for eBPF or a libbpf CGo binding to obtain, sitting in two
+  text files. Its parser takes an `io.Reader`, so it is tested on a machine with
+  no `/proc`.
+- **Benchmarks of the boundary itself**, which is the number that decides how a
+  binding is shaped:
+
+  | | ns/op |
+  | --- | --- |
+  | Go call | 0.29 |
+  | CGo call | 20.7 |
+  | `C.GoBytes` (64 B) | 19.6 |
+  | `C.CString` + `free` | 63.9 |
+  | pass a Go pointer (64 B) | 26.4 |
+  | ...through a `runtime.Pinner` | 57.7 |
+  | ...copied with `C.CBytes` | 95.4 |
+
+  A CGo call costs ~70× a Go call, so a binding must cross rarely and do much on
+  the far side. `runtime.Pinner` is *not* needed to pass a `[]byte` to a
+  synchronous C call — the pointer rules already allow it — and pinning anyway
+  doubles the cost. And the callback path measures **faster** per packet than the
+  synchronous one (≈128ns vs ≈153ns), because `pcap_loop` crosses into C once and
+  amortises it over every packet. The comment that first claimed otherwise was
+  corrected by the benchmark.
+- **Graceful degradation and the cross-compilation tax.** Capture lives behind
+  the `cgo` build tag; `CGO_ENABLED=0` still builds a complete agent that reports
+  the collector as unavailable. `make cross-nocgo` cross-compiles to four
+  platforms from nothing; `make cross-cgo` fails on purpose, and its error is the
+  lesson. New CI jobs build, vet and test both modes — the no-CGo job is what
+  caught `ErrTimeout` being declared in the CGo file and used from a shared one.
+- Agent flags: `-network` (off by default), `-network-device`, `-network-file`,
+  `-network-filter`, `-network-snaplen`. Every failure to open a capture —
+  no CGo, no libpcap, no permission, no such interface — is logged once and
+  skipped. An agent that will not start because it could not open a raw socket
+  reports nothing at all.
+
+### Fixed (found by the stage's own adversarial review)
+
+- **A panicking `Loop` callback never stopped the loop.** The handler recovered
+  the panic and recorded an error, but `pcap_loop` kept dispatching: on a
+  savefile the file ends and hides it; on a live interface `Loop` blocks forever,
+  holding the read lock `Close` needs. The recover now calls `pcap_breakloop`.
+  The first regression test for this was itself decorative — it counted callback
+  invocations, which are suppressed either way — so the test now measures the
+  time the loop takes against a full traversal.
+- **`Collect` entered libpcap concurrently with the capture goroutine.** An
+  `RWMutex` guards the handle's *lifetime*, but it lets two readers in at once,
+  so `Collect`→`pcap_stats` ran while `Run` sat in `pcap_next_ex` on the same,
+  non-thread-safe `pcap_t`. A separate mutex now serialises every entry into
+  libpcap (except `pcap_breakloop`, which must interrupt rather than wait), and
+  the collector samples the drop counters on its own goroutine, so `Collect`
+  reads only atomics.
+- **`cgo.Handle.Value` panicked outside the recover** — the one call in the
+  exported handler able to unwind into a C stack frame was the one not guarded.
+- **The `!cgo` stub had no test at all**; `make test-nocgo` was a compile check.
+  Its contract is now pinned.
+- **`FuzzParse`'s seeds named the wrong link types**: the seed passed
+  `int(LinkRaw)`=12, which the modulo mapped onto loopback. The corpus looked
+  complete while covering the wrong branches. Seeds now pass indices, and a test
+  fails if the table is reordered.
+- **The `/proc/net` parser accepted a line naming no protocol** (`":"`),
+  producing a section with an empty prefix. Found by a fuzz invariant asserting
+  the parser never reports a name or value absent from its input.
+
+### Notes
+
+- **eBPF is documented, not shipped.** `cilium/ebpf` is Linux-only and its
+  toolchain needs `clang`, `vmlinux.h` and a kernel to attach to; none of that
+  could be compiled or run on the machine this stage was built on. Committing a
+  few hundred lines of Linux-only Go and restricted C that has never been through
+  a compiler would contradict the discipline established in v0.9.0. The `kernel`
+  collector ships instead: it is the same metrics, obtained the way you should
+  check for first. `ARCHITECTURE.md` records what the eBPF path would look like
+  and when it is worth its price.
+
 ## [0.9.0] - 2026-07-09
 
 Testing, benchmarking and profiling raised from "as we went" to an engineering
@@ -495,7 +616,8 @@ collector server over HTTP.
 
 - Go 1.26; `github.com/shirou/gopsutil/v4` for cross-platform metric collection.
 
-[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ANTON-IVANOVICH/TraceForge/compare/v0.6.0...v0.7.0

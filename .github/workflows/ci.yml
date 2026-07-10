@@ -20,11 +20,17 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      # The agent's packet-capture collector links against libpcap. Without this
+      # the default (CGo-enabled) build cannot compile — which is precisely the
+      # cost of a CGo dependency, paid here so it is not paid in production.
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: gofmt
         run: |
@@ -35,24 +41,37 @@ jobs:
 
       # vet each build tag: code behind //go:build integration is invisible to a
       # plain vet, and rots quietly until the day someone runs it.
+      # vet each build tag AND each CGo mode: code behind //go:build integration
+      # or //go:build !cgo is invisible to a plain vet, and rots quietly until
+      # the day someone runs it.
       - name: go vet
         run: |
           go vet ./...
+          CGO_ENABLED=0 go vet ./...
           go vet -tags=integration ./...
           go vet -tags=e2e ./test/e2e/...
 
-      - uses: golangci/golangci-lint-action@v6
+      # golangci-lint-action v6 rejects a v2.x linter version outright; v7 was
+      # the first to accept one, and v8 is the first to run on Node 24. The
+      # linter version pinned here must stay in step with `make lint`.
+      - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
 
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      # The agent's packet-capture collector links against libpcap. Without this
+      # the default (CGo-enabled) build cannot compile — which is precisely the
+      # cost of a CGo dependency, paid here so it is not paid in production.
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       # -race is non-negotiable. A data race is not reproducible on demand: it
       # shows up under load, on someone else's machine, in production. The
@@ -66,7 +85,7 @@ jobs:
       - name: coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: coverage
           path: coverage.out
@@ -74,11 +93,17 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      # The agent's packet-capture collector links against libpcap. Without this
+      # the default (CGo-enabled) build cannot compile — which is precisely the
+      # cost of a CGo dependency, paid here so it is not paid in production.
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: integration tests
         run: go test -race -count=1 -tags=integration -timeout=10m ./...
@@ -86,11 +111,17 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      # The agent's packet-capture collector links against libpcap. Without this
+      # the default (CGo-enabled) build cannot compile — which is precisely the
+      # cost of a CGo dependency, paid here so it is not paid in production.
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       # The suite builds the binaries itself, so there is no `make build` step to
       # fall out of sync with it.
@@ -103,21 +134,70 @@ jobs:
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      # The agent's packet-capture collector links against libpcap. Without this
+      # the default (CGo-enabled) build cannot compile — which is precisely the
+      # cost of a CGo dependency, paid here so it is not paid in production.
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: fuzz every target briefly
         run: make fuzz FUZZTIME=15s
 
       # A crasher found on CI is worthless if it dies with the runner.
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fuzz-crashers
           path: "**/testdata/fuzz/**"
+
+
+  # The same suite with the C compiler taken away.
+  #
+  # A build tag nobody exercises is a build tag that rots. This job is what
+  # caught ErrTimeout being declared in the CGo file and used from a shared one:
+  # the tagged build compiled, the portable one did not.
+  nocgo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Deliberately no libpcap: the point is that this build needs nothing.
+      - name: build, vet and test without CGo
+        run: |
+          CGO_ENABLED=0 go build ./...
+          CGO_ENABLED=0 go vet ./...
+          CGO_ENABLED=0 go test -race -count=1 ./...
+
+      - name: the agent still starts and says why capture is off
+        run: |
+          CGO_ENABLED=0 go build -o /tmp/agent ./cmd/agent
+          # No server to talk to; we only assert it does not die on -network.
+          timeout 5 /tmp/agent -network -network-device=eth0 -interval=1s 2>&1 | tee /tmp/agent.log || true
+          grep -q "network collector disabled" /tmp/agent.log
+
+  # CGo is what makes `GOOS=linux GOARCH=arm64 go build` stop working. The
+  # pure-Go build must keep cross-compiling everywhere, from nothing.
+  cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: cross-compile the pure-Go agent
+        run: make cross-nocgo
 
   # Benchmarks on a shared CI runner are noisy — a neighbouring job can move a
   # number by 30%. benchcmp answers with a p-value instead of a percentage, so a
@@ -126,13 +206,16 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: benchmark the base branch
         run: |

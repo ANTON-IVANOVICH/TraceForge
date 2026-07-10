@@ -1,6 +1,6 @@
 .PHONY: tidy build test vet lint lint-install run-server run-agent run-ctl proto proto-tools install-ctl \
 	test-unit test-integration test-e2e test-all cover cover-html fuzz fuzz-long bench bench-save bench-compare \
-	mutate profile-cpu profile-heap profile-trace tools
+	mutate profile-cpu profile-heap profile-trace tools build-nocgo cross-nocgo cross-cgo test-nocgo
 
 GOBIN := $(shell go env GOPATH)/bin
 
@@ -39,6 +39,55 @@ build:
 	go build -o bin/server ./cmd/server
 	go build -o bin/agent ./cmd/agent
 	go build -ldflags '$(LDFLAGS)' -o bin/metricsctl ./cmd/metricsctl
+
+# ---------------------------------------------------------------------------
+# CGo, and the price of it.
+#
+# The agent's packet-capture collector links against libpcap. The moment a
+# project takes a CGo dependency it loses three things it probably valued:
+#
+#   1. `GOOS=linux GOARCH=arm64 go build` — the one-command cross-compile. CGo
+#      needs a C compiler and the C library headers for the *target*, not the
+#      host, and the host toolchain cannot produce them. Try `make cross-cgo`
+#      and read the error; it is the whole lesson.
+#   2. A static binary. A CGo build links libc dynamically, so the container
+#      needs a matching one — no more FROM scratch.
+#   3. Building at all on a machine without libpcap installed.
+#
+# So capture sits behind the `cgo` build tag and `CGO_ENABLED=0` still produces
+# a complete agent, minus that one collector. Both builds are compiled and
+# tested in CI, because a build tag nobody exercises is a build tag that rots.
+# ---------------------------------------------------------------------------
+
+# The portable agent: no C, static, cross-compiles anywhere. `-network` reports
+# itself unavailable instead of failing.
+build-nocgo:
+	@mkdir -p bin
+	CGO_ENABLED=0 go build -o bin/agent-nocgo ./cmd/agent
+	CGO_ENABLED=0 go build -o bin/server-nocgo ./cmd/server
+
+# Proof that the pure-Go build cross-compiles with nothing installed.
+CROSS_TARGETS := linux/amd64 linux/arm64 darwin/arm64 windows/amd64
+cross-nocgo:
+	@for t in $(CROSS_TARGETS); do \
+		os=$${t%/*}; arch=$${t#*/}; \
+		printf 'CGO_ENABLED=0 %-14s ' "$$os/$$arch"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -o /dev/null ./cmd/agent && echo ok || exit 1; \
+	done
+
+# Proof that the CGo build does not. Expected to fail on a host whose C
+# toolchain cannot target the requested platform — that failure is the point.
+# The escape hatches, in order of how much you will regret them:
+#   docker buildx --platform linux/arm64   (a real target toolchain, via QEMU)
+#   CC="zig cc -target aarch64-linux-musl" (zig ships every libc)
+#   CGO_ENABLED=0                          (want it less)
+cross-cgo:
+	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/agent
+
+# The unit suite, compiled without C. It catches the mistake the tagged build
+# cannot: a symbol defined only in the CGo file but used from a shared one.
+test-nocgo:
+	CGO_ENABLED=0 $(GOTEST) -race ./...
 
 # The development tools this repo ships rather than depends on: a benchmark
 # comparator and a mutation tester.
@@ -79,6 +128,7 @@ test-all: test-unit test-integration test-e2e
 
 vet:
 	go vet ./...
+	CGO_ENABLED=0 go vet ./...
 	go vet -tags=integration ./...
 	go vet -tags=e2e ./test/e2e/...
 

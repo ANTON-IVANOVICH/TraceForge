@@ -4,7 +4,7 @@ A catalog of end-to-end flows the system supports, written as runnable recipes.
 This file is maintained alongside the staged roadmap: each milestone that adds a
 user-visible capability also adds or updates the relevant scenarios here.
 
-- **Covers up to:** v0.9.0 (testing, benchmarking & profiling)
+- **Covers up to:** v0.10.0 (CGo: libpcap binding, and the alternatives to it)
 - **Last updated:** 2026-07-09
 
 Conventions used below:
@@ -650,10 +650,67 @@ rules exist; `metricsctl --context <TAB>` lists the configured contexts.
 | Rate-limiter key flood | a stream of distinct agent ids / IPs | bucket map capped and swept, not grown until OOM |
 | Storage write failure | `WriteBatch` errors (full disk) | metrics counted in `stats.failed`, surfaced on the dashboard |
 | pprof on the API port | `GET /debug/pprof/` without `-pprof-addr` | `404` — profiling is a separate, opt-in listener |
+| Capture without privileges | `agent -network -network-device=en0` as a normal user | warning logged, agent keeps reporting CPU/memory/disk |
+| Capture in a no-CGo binary | `CGO_ENABLED=0` agent with `-network` | warning logged, agent runs on |
+| `-network` with no target | neither `-network-device` nor `-network-file` | warning logged, agent runs on |
+| Invalid BPF filter | `-network-filter='not a filter'` | capture fails to open; collector disabled, agent runs on |
+| Cross-compiling with CGo | `make cross-cgo` | build error — the host toolchain cannot target another platform |
 
 ---
 
-## 10. Developer workflows — testing, benchmarking, profiling
+## 10. Network metrics via CGo (libpcap)
+
+The agent's one crossing into C. It is off by default and every failure is
+non-fatal, because an agent that will not start because it could not open a raw
+socket reports nothing at all.
+
+```bash
+# A savefile: no privileges needed, and how the package is tested.
+./bin/agent -network -network-file=capture.pcap -network-filter=
+
+# A live interface: root on macOS (/dev/bpf*), CAP_NET_RAW on Linux.
+sudo ./bin/agent -network -network-device=en0 -network-filter='ip or ip6'
+
+# The filter is compiled and applied in the kernel, so non-matching packets
+# never cross into user space at all.
+sudo ./bin/agent -network -network-device=eth0 -network-filter='tcp port 443'
+```
+
+```bash
+curl -s 'http://localhost:8080/api/v1/query?name=net_protocol_packets_total' | jq '.[] | {p:.labels.protocol, v:.value}'
+# {"p":"tcp","v":3} {"p":"udp","v":2} {"p":"icmp","v":1}
+```
+
+`net_bytes_total` counts the wire length, not the truncated copy;
+`net_kernel_dropped_total` reports what the kernel discarded before this process
+saw it — without it, the other counters go quiet exactly when the network is
+busiest.
+
+**The CGo tax, and how to avoid paying it:**
+
+```bash
+make build           # with capture; needs libpcap on the host
+make build-nocgo     # CGO_ENABLED=0 — complete agent, capture reports unavailable
+make cross-nocgo     # cross-compiles to 4 platforms from nothing
+make cross-cgo       # fails on purpose: the error is the lesson
+make test-nocgo      # the suite with the C compiler taken away
+go test -bench . ./internal/agent/network/   # what a border crossing costs
+```
+
+A CGo call is ~20ns against ~0.3ns for a Go call. That single number decides the
+shape of every binding: cross rarely, do much on the far side.
+
+**And the alternative you should check first** — the same class of kernel
+counters, with no C at all:
+
+```bash
+# Linux only; reads /proc/net/snmp and /proc/net/netstat.
+curl -s 'http://localhost:8080/api/v1/query?name=tcp_retransmit_segments_total'
+```
+
+---
+
+## 11. Developer workflows — testing, benchmarking, profiling
 
 The whole point of stage 9: the tools an engineer reaches for when a green build
 is not enough. All are `make` targets; none pull in an external dependency.

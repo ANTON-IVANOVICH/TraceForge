@@ -351,6 +351,75 @@ which rules exist:
 source <(metricsctl completion bash)     # or zsh|fish|powershell
 ```
 
+## Network metrics & CGo
+
+The agent can capture packets through **libpcap** and report per-protocol
+counters. It is the project's one crossing into C, and it is opt-in:
+
+```bash
+sudo ./bin/agent -network -network-device=en0        # live: needs root (/dev/bpf*) or CAP_NET_RAW
+./bin/agent -network -network-file=capture.pcap      # a savefile: no privileges at all
+./bin/agent -network -network-device=eth0 -network-filter='tcp port 443'
+```
+
+The BPF filter is compiled and applied **in the kernel**, so packets that do not
+match never cross into user space. `-network-snaplen` caps how much of each
+packet is copied out; the headers are all that gets classified.
+
+Metrics: `net_packets_total`, `net_bytes_total` (wire length, not the truncated
+copy), `net_protocol_packets_total{protocol=tcp|udp|icmp|other}`,
+`net_ip_packets_total{version=4|6}`, `net_unparsed_packets_total`, and
+`net_kernel_dropped_total` — which keeps the others honest, because under load
+the kernel drops packets before this process ever sees them.
+
+**Every failure is non-fatal.** Built without CGo, no libpcap, no permission, no
+such interface: the agent logs once and keeps reporting CPU, memory and disk.
+
+### The cost of CGo
+
+Capture lives behind the `cgo` build tag, because taking a CGo dependency costs
+the one-command cross-compile, the static binary, and the ability to build on a
+machine without libpcap:
+
+```bash
+make build           # with capture (needs libpcap)
+make build-nocgo     # CGO_ENABLED=0: complete agent, capture reports unavailable
+make cross-nocgo     # cross-compiles to linux/{amd64,arm64}, darwin, windows — from nothing
+make cross-cgo       # fails on purpose; read the error
+make test-nocgo      # the suite with the C compiler taken away
+```
+
+Escape hatches for a CGo cross-build, in order of how much you will regret them:
+`docker buildx --platform linux/arm64`, `CC="zig cc -target aarch64-linux-musl"`,
+or wanting it less (`CGO_ENABLED=0`).
+
+Boundary costs, measured (`go test -bench . ./internal/agent/network/`):
+
+| | ns/op |
+| --- | --- |
+| Go call | 0.29 |
+| **CGo call** | **20.7** |
+| `C.GoBytes` copy (64 B) | 19.6 |
+| `C.CString` + `C.free` | 63.9 |
+| pass a Go pointer (64 B) | 26.4 |
+| ...wrapped in `runtime.Pinner` | 57.7 |
+| ...copied with `C.CBytes` | 95.4 |
+
+A CGo call is ~70× a Go call, so a binding must cross **rarely** and do much on
+the far side — which is why the C shim returns a whole packet per call, not a
+field per call. `runtime.Pinner` is *not* required to pass a `[]byte` to a
+synchronous C function (the pointer rules already allow it); pinning anyway
+doubles the cost.
+
+### Kernel counters without CGo
+
+Before reaching for CGo — or eBPF — check whether the kernel already publishes
+what you want. `internal/agent/kernel` reads TCP retransmits, resets,
+listen-queue overflows and UDP errors straight out of `/proc/net/snmp` and
+`/proc/net/netstat`: no C, no dependencies, no privileges, and it cross-compiles.
+See `ARCHITECTURE.md` for when eBPF earns its price and why it is documented here
+rather than shipped.
+
 ## Storage backends
 
 Pick the store with `-storage`; persistent backends keep data in `-data-dir`.
@@ -498,6 +567,15 @@ Development is trunk-based on `main`, with a SemVer tag per milestone:
   `0600` credentials, `table|json|yaml|name` output, declarative idempotent
   `rules apply -f`, `alerts list --watch`, silences, dynamic shell completion,
   TTY/`NO_COLOR` manners, and POSIX exit codes.
+- **v0.10.0** — CGo: a from-scratch **libpcap binding** for the agent (memory
+  ownership, an `RWMutex` that stops `Close` freeing a handle another goroutine
+  is inside, C→Go callbacks through `runtime/cgo.Handle`, a C shim rather than C
+  in a comment), a link-layer-aware packet parser, and benchmarks of the boundary
+  itself (a CGo call costs ~70× a Go call). Capture sits behind the `cgo` build
+  tag, so `CGO_ENABLED=0` still yields a complete, statically linked,
+  cross-compilable agent. Alongside it, `internal/agent/kernel` reads the same
+  class of kernel counters from `/proc/net/snmp` with **no CGo at all** — the
+  alternative you are supposed to check first.
 - **v0.9.0** — Testing, benchmarking & profiling as a discipline: the test
   pyramid split by build tag (unit/integration/e2e); 17 invariant-based fuzz
   targets; a benchmark suite; `benchcmp` (a from-scratch benchstat with a
