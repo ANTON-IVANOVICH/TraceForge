@@ -35,7 +35,7 @@ func TestBoltStorage_PersistAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s2.Close()
+	defer func() { _ = s2.Close() }()
 
 	got, err := s2.Query(storage.Query{Name: "cpu"})
 	if err != nil {
@@ -60,7 +60,7 @@ func TestBoltStorage_RangeAndAggregation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i, v := range []float64{10, 20, 30, 40} {
@@ -97,7 +97,7 @@ func TestBoltStorage_LabelFilterAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	now := time.Now().UTC()
 	_ = s.WriteBatch([]model.Metric{

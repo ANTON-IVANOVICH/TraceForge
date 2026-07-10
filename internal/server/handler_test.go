@@ -110,7 +110,7 @@ func TestHandler_IngestOverloaded(t *testing.T) {
 
 func TestHandler_QueryByName(t *testing.T) {
 	h, _, store := newTestHandler(pipeline.Config{IngestBuffer: 10}, false)
-	store.Write(model.Metric{Name: "cpu_usage_percent", Type: model.MetricTypeGauge, Value: 7, Timestamp: time.Now().UTC(), Labels: map[string]string{"host": "a"}})
+	_ = store.Write(model.Metric{Name: "cpu_usage_percent", Type: model.MetricTypeGauge, Value: 7, Timestamp: time.Now().UTC(), Labels: map[string]string{"host": "a"}})
 
 	rec := doReq(h.Routes(), http.MethodGet, "/api/v1/query?name=cpu_usage_percent&host=a", nil)
 	if rec.Code != http.StatusOK {

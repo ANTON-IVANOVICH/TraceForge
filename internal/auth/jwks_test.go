@@ -56,7 +56,7 @@ func TestKeySetResolvesAndVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if got.N.Cmp(key.PublicKey.N) != 0 {
+	if got.N.Cmp(key.N) != 0 {
 		t.Fatal("resolved wrong key")
 	}
 

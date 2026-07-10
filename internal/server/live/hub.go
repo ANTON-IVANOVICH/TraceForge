@@ -139,7 +139,7 @@ func (h *Hub) Run(ctx context.Context) {
 		case <-ctx.Done():
 			for c := range h.clients {
 				close(c.send)
-				go c.conn.Close() // off the hub goroutine: Close may block on a stalled socket
+				go func() { _ = c.conn.Close() }() // off the hub goroutine: Close may block on a stalled socket
 			}
 			h.clients = map[*client]struct{}{}
 			return
@@ -151,7 +151,7 @@ func (h *Hub) Run(ctx context.Context) {
 			if _, ok := h.clients[c]; ok {
 				delete(h.clients, c)
 				close(c.send)
-				go c.conn.Close() // off the hub goroutine: Close may block on a stalled socket
+				go func() { _ = c.conn.Close() }() // off the hub goroutine: Close may block on a stalled socket
 			}
 		case ms := <-h.metricsCh:
 			h.broadcastMetrics(ms)
